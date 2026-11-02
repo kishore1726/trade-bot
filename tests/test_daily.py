@@ -57,8 +57,9 @@ class FakeFetch:
     def __init__(self, bars, error=None):
         self.bars, self.error, self.calls = bars, error, []
 
-    def __call__(self, tickers, start, end, cfg):
+    def __call__(self, tickers, start, end, cfg, now=None):
         self.calls.append((list(tickers), start, end))
+        self.now = now
         if self.error:
             raise self.error
         lo, hi = pd.Timestamp(start), pd.Timestamp(end)
@@ -273,11 +274,11 @@ def test_kill_switch_trips_and_alerts(cfg, store, scripted):
     assert len([m for m in sender.messages if "/resume" in m]) == 1
 
 
-def random_bars(n_warm=40, n_days=30, seed=7):
+def random_bars(n_warm=40, n_days=30, seed=7, tickers=TICKERS):
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range("2024-01-01", periods=n_warm + n_days)
     out = {}
-    for i, t in enumerate(TICKERS + [BENCH]):
+    for i, t in enumerate(list(tickers) + [BENCH]):
         close = 100 * np.cumprod(1 + rng.normal(0, 0.02, len(idx)))
         opens = close * (1 + rng.normal(0, 0.005, len(idx)))
         lows = np.minimum(opens, close) * (1 - np.abs(rng.normal(0, 0.01, len(idx))))
@@ -348,3 +349,103 @@ def test_below_benchmark_label_from_backtest_summary(cfg, store, scripted):
     sender = Sender()
     run(TUE, cfg, store, FakeFetch(flat_bars()), sender)
     assert "BELOW BENCHMARK" in sender.messages[-1]
+
+
+class FailingSender(Sender):
+    """Records every message; raises when the text contains `fail_on`."""
+    def __init__(self, fail_on):
+        super().__init__()
+        self.fail_on = fail_on
+
+    def __call__(self, text, store):
+        self.messages.append(text)
+        if self.fail_on in text:
+            raise RuntimeError("sender broke")
+        return True
+
+
+def test_failure_after_commit_reports_processed_days(cfg, store, scripted):
+    start_paper(store, MON)
+    sender = FailingSender("Daily summary")
+    assert run(FRI, cfg, store, FakeFetch(flat_bars()), sender) == [TUE, WED, THU, FRI]
+    assert store.get("last_processed_day") == FRI.isoformat()
+    # Weekly report still sent even though the daily summary failed.
+    assert any(m.startswith("Weekly report") for m in sender.messages)
+    alerts = [m for m in sender.messages if "failed while preparing the report" in m]
+    assert len(alerts) == 1 and FRI.isoformat() in alerts[0] and TUE.isoformat() in alerts[0]
+    assert not any("Nothing was traded" in m for m in sender.messages)
+    assert "sender broke" in (cfg.state_path.parent.parent / "logs" / "tradebot.log").read_text()
+
+
+def test_weekly_failure_keeps_summary_and_week_unmarked(cfg, store, scripted, monkeypatch):
+    start_paper(store, MON)
+
+    def boom(*a, **k):
+        raise RuntimeError("metrics broke")
+    monkeypatch.setattr(daily, "_paper_metrics", boom)
+    sender = Sender()
+    assert run(FRI, cfg, store, FakeFetch(flat_bars()), sender) == [TUE, WED, THU, FRI]
+    assert any(m.startswith(f"Daily summary {FRI.isoformat()}") for m in sender.messages)
+    assert any("failed while preparing the report" in m for m in sender.messages)
+    assert store.get("last_weekly_week") is None  # retried on a later run
+
+
+def test_failure_in_later_commit_returns_committed_days(cfg, store, scripted, monkeypatch):
+    start_paper(store, MON)
+    real = store.transaction
+    count = {"n": 0}
+
+    def flaky():
+        count["n"] += 1
+        if count["n"] == 2:
+            raise RuntimeError("disk full")
+        return real()
+    monkeypatch.setattr(store, "transaction", flaky)
+    sender = Sender()
+    assert run(THU, cfg, store, FakeFetch(flat_bars()), sender) == [TUE]
+    assert store.get("last_processed_day") == TUE.isoformat()
+    (msg,) = sender.messages
+    assert "failed while preparing the report" in msg and TUE.isoformat() in msg
+
+
+def test_unknown_strategy_alerts_once_per_day(cfg, store):
+    start_paper(store, MON, name="nosuch")
+    fetch, sender = FakeFetch(flat_bars()), Sender()
+    assert run(TUE, cfg, store, fetch, sender) == []
+    assert run(TUE, cfg, store, fetch, sender) == []
+    (msg,) = sender.messages
+    assert "nosuch" in msg and "/choose" in msg and "Something went wrong" not in msg
+    assert fetch.calls == [] and store.get("last_processed_day") == MON.isoformat()
+
+
+def test_now_passed_to_fetch(cfg, store, scripted):
+    start_paper(store, MON)
+    fetch = FakeFetch(flat_bars())
+    now = after_close(TUE)
+    run(TUE, cfg, store, fetch, Sender(), now=now)
+    assert fetch.now() == now()
+
+
+@pytest.mark.parametrize("name", sorted(REGISTRY))
+def test_real_strategy_catch_up_same_as_day_by_day(cfg, tmp_path, name):
+    """Look-ahead check for the real strategies: a 15-day catch-up (bars include later days)
+    must equal 15 single-day runs (bars end on the day)."""
+    from dataclasses import replace
+    tickers = [f"T{i}.NS" for i in range(8)]
+    cfg = replace(cfg, universe=tickers)
+    bars, days = random_bars(n_warm=260, n_days=15, seed=11, tickers=tickers)
+    start = (pd.Timestamp(days[0]) - pd.offsets.BDay(1)).date()
+    s1, s2 = Store(tmp_path / "one.sqlite"), Store(tmp_path / "two.sqlite")
+    try:
+        for s in (s1, s2):
+            start_paper(s, start, name=name)
+        assert run(days[-1], cfg, s1, FakeFetch(bars), Sender()) == days
+        for d in days:
+            assert run(d, cfg, s2, FakeFetch(bars), Sender()) == [d]
+        for key in ("portfolio", "pending_signals", "equity_history", "last_processed_day"):
+            assert s1.get(key) == s2.get(key), key
+        p = s1.get("portfolio")
+        assert p["positions"] or p["trades"] or s1.get("pending_signals")  # not vacuous
+    finally:
+        s1.close()
+        s2.close()

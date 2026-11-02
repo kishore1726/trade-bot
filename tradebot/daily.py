@@ -5,7 +5,9 @@ Runs unattended. Rules:
 - Each day goes through backtest.step_day (Ruling R3), so paper == backtest by construction.
 - Bad data or a failed download -> alert, stop, don't advance "last_processed_day".
 - All days are computed in memory first; only then is each day committed in its own
-  store transaction, so an unexpected error leaves the stored state untouched.
+  store transaction, so an unexpected error while computing leaves the stored state untouched.
+  An error after days were saved (later commit, reports) says which days were processed and
+  returns them.
 - The kill switch is never cleared here (Ruling R11): only the owner's /resume does that.
 """
 from __future__ import annotations
@@ -128,25 +130,43 @@ def run_daily(today: date, cfg: Config, store: Store, fetch=fetch_bars, sender=s
               now: Callable[[], datetime] | None = None) -> list[date]:
     """Process every trading day after "last_processed_day" up to `today` (today only after
     16:15 IST). Returns the days processed. Never raises."""
+    committed: list[date] = []  # days already saved, even if a later step fails
     try:
-        return _run(today, cfg, store, fetch, sender, now)
+        return _run(today, cfg, store, fetch, sender, now, committed)
     except Exception:
         _log_exception(cfg, "daily run failed")
         try:
             store.log_event("daily_error", {"day": today.isoformat()})
         except Exception:
             pass
-        sender(reports.alert(ERROR_TEXT), store)
-        return []
+        try:
+            sender(reports.alert(_partial_text(committed) if committed else ERROR_TEXT), store)
+        except Exception:
+            _log_exception(cfg, "sending the error alert failed")
+        return list(committed)
 
 
-def _run(today, cfg, store, fetch, sender, now) -> list[date]:
+def _partial_text(days: list[date]) -> str:
+    return (f"Tonight's run processed {', '.join(d.isoformat() for d in days)} but failed while "
+            "preparing the report. Details saved in the log file.")
+
+
+def _remind_once(store: Store, today: date, sender, text: str) -> None:
+    if store.get("last_reminder") != today.isoformat():
+        store.set("last_reminder", today.isoformat())
+        sender(reports.alert(text), store)
+
+
+def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[date]:
     name = store.get("chosen_strategy")
     if not name:
-        if store.get("last_reminder") != today.isoformat():
-            store.set("last_reminder", today.isoformat())
-            sender(reports.alert("Paper trading has not started: no strategy chosen yet. "
-                                 + reports.CHOOSE_LINE), store)
+        _remind_once(store, today, sender, "Paper trading has not started: no strategy chosen yet. "
+                     + reports.CHOOSE_LINE)
+        return []
+    if name not in REGISTRY:
+        _remind_once(store, today, sender,
+                     f"The chosen strategy \"{name}\" is not known to this bot, so nothing was "
+                     f"traded. Send /choose <name> with one of: {', '.join(sorted(REGISTRY))}.")
         return []
 
     last = store.get("last_processed_day")
@@ -165,7 +185,7 @@ def _run(today, cfg, store, fetch, sender, now) -> list[date]:
     tickers = list(dict.fromkeys(cfg.universe + [cfg.benchmark] + list(portfolio.positions)))
     start = min(days[0] - timedelta(days=WARMUP_DAYS), paper_start)
     try:
-        bars = fetch(tickers, start, days[-1], cfg)
+        bars = fetch(tickers, start, days[-1], cfg, now=lambda: t)  # same clock as the cutoff
     except Exception:
         _log_exception(cfg, "market data download failed")
         sender(reports.alert("Could not download market data tonight. Nothing was traded; "
@@ -204,26 +224,53 @@ def _run(today, cfg, store, fetch, sender, now) -> list[date]:
                 "day": r.d.isoformat(), "equity": r.equity, "buys": r.buys,
                 "sells": [x.ticker for x in r.sells], "stops": [x.ticker for x in r.stop_exits],
                 "skipped": [list(x) for x in r.skipped], "kill_tripped": r.kill_tripped_today})
+        committed.append(r.d)
 
-    # Messages after the transactions (send writes the outbox itself).
-    for day in done:
-        if day.result.kill_tripped_today:
-            sender(reports.alert(
-                f"Safety switch tripped on {day.result.d.isoformat()}: the paper account fell "
-                f"{cfg.kill_switch_dd_pct * 100:.0f}% or more below its highest value. "
-                "New buys are paused; stop-losses and sells still run. "
-                "Send /resume when you're ready."), store)
-    if done:
+    # Messages after the transactions (send writes the outbox itself). Each phase is guarded
+    # separately so one failure doesn't suppress the others.
+    failed = False
+
+    def phase(what: str, fn: Callable[[], None]) -> None:
+        nonlocal failed
+        try:
+            fn()
+        except Exception:
+            failed = True
+            _log_exception(cfg, f"{what} failed")
+
+    def kill_alerts() -> None:
+        for day in done:
+            if day.result.kill_tripped_today:
+                sender(reports.alert(
+                    f"Safety switch tripped on {day.result.d.isoformat()}: the paper account fell "
+                    f"{cfg.kill_switch_dd_pct * 100:.0f}% or more below its highest value. "
+                    "New buys are paused; stop-losses and sells still run. "
+                    "Send /resume when you're ready."), store)
+
+    def summary() -> None:
         last_r = done[-1].result
         sender(reports.daily_summary(
             last_r.d, state.portfolio, last_r.equity, last_r.new_signals,
             last_r.sells + last_r.stop_exits, [x.result.d for x in done[:-1]], name,
             _below_benchmark(store, name), skipped=last_r.skipped), store)
+
+    def weekly() -> None:
         week_ends = [x.result.d for x in done if _last_day_of_week(x.result.d, cfg)]
         if week_ends and store.get("last_weekly_week") != _week_key(week_ends[-1]):
-            store.set("last_weekly_week", _week_key(week_ends[-1]))
             metrics = _paper_metrics(state.portfolio, history, bars, cfg)
             sender(reports.weekly_report(metrics, name, _oos(store, name)), store)
+            # Only after send() was called (a False return is fine: it's queued in the outbox).
+            store.set("last_weekly_week", _week_key(week_ends[-1]))
+
+    if done:
+        phase("kill-switch alert", kill_alerts)
+        phase("daily summary", summary)
+        phase("weekly report", weekly)
     if bad is not None:
-        sender(_problems_text(*bad), store)
-    return [x.result.d for x in done]
+        phase("bad-data alert", lambda: sender(_problems_text(*bad), store))
+    if failed:
+        if committed:
+            sender(reports.alert(_partial_text(committed)), store)
+        else:
+            sender(reports.alert(ERROR_TEXT), store)
+    return list(committed)
