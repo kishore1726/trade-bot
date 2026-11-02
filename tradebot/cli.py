@@ -54,9 +54,9 @@ def _today() -> date:
 
 def cmd_backtest(cfg, store, start: date) -> int:
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # yfinance prints pandas deprecation noise
-            bars = fetch_bars(sorted(set(cfg.universe) | {cfg.benchmark}), start, _today(), cfg)
+        import yfinance  # noqa: F401  (it installs its own warning filter on import; silence it after)
+        warnings.simplefilter("ignore")  # yfinance prints pandas deprecation noise (CLI process only)
+        bars = fetch_bars(sorted(set(cfg.universe) | {cfg.benchmark}), start, _today(), cfg)
     except Exception:
         _log_traceback("backtest: market data download failed")
         print("Could not download market data. Check your internet connection and try again. "
