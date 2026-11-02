@@ -17,6 +17,9 @@ from tradebot.config import Config
 
 Bars = dict[str, pd.DataFrame]
 COLS = ["open", "high", "low", "close", "volume"]
+# Ruling R8: interior gaps (trading days missing from the cache) are only detected and
+# refetched within the last GAP_WINDOW trading days up to `end`. Older interior gaps are accepted.
+GAP_WINDOW = 30
 
 
 def _normalise(df: pd.DataFrame) -> pd.DataFrame:
@@ -32,6 +35,10 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
         idx = idx.tz_localize(None)
     df.index = idx.normalize()
     df.index.name = "date"
+    # A bad bar (NaN or non-positive price) becomes a missing bar, so it is never cached
+    # as if good and gets refetched on the next run.
+    ohlc = df[["open", "high", "low", "close"]]
+    df = df[ohlc.notna().all(axis=1) & (ohlc > 0).all(axis=1)]
     df = df[~df.index.duplicated(keep="last")]
     return df.sort_index()
 
@@ -80,10 +87,12 @@ def fetch_bars(
                     parts.append(_normalise(source(t, start, first)))
                 if last < needed[-1]:
                     parts.append(_normalise(source(t, last, end)))
+                have = {i.date() for i in cached.index}
+                gaps = [d for d in needed[-GAP_WINDOW:] if d not in have and first < d < last]
+                if gaps:
+                    parts.append(_normalise(source(t, gaps[0], gaps[-1])))
             if len(parts) > 1:
-                merged = _normalise(pd.concat([p for p in parts if not p.empty])) if any(
-                    not p.empty for p in parts
-                ) else cached
+                merged = _normalise(pd.concat(parts))
                 if not merged.equals(cached):
                     merged.to_csv(path)
                 cached = merged

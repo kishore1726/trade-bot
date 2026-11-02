@@ -133,3 +133,38 @@ def test_validate_empty_bars_and_empty_frame():
     bars["A.NS"] = bars["A.NS"].iloc[0:0]
     p = validate_day(bars, D)
     assert len(p) == 1 and "A.NS" in p[0]
+
+
+def test_bad_bar_is_not_frozen_in_cache(tmp_path):
+    cfg = cfg_in(tmp_path)
+    n = []
+
+    def src(t, s, e):
+        n.append(1)
+        df = frame(["2026-11-02", "2026-11-03"])
+        if len(n) == 1:
+            df.loc["2026-11-03", "close"] = np.nan
+        return df
+
+    first = fetch_bars(["A.NS"], date(2026, 11, 2), D, cfg, source=src)
+    assert validate_day(first, D)
+    second = fetch_bars(["A.NS"], date(2026, 11, 2), D, cfg, source=src)
+    assert len(n) == 2
+    assert validate_day(second, D) == []
+
+
+def test_interior_gap_within_window_is_filled(tmp_path):
+    cfg = cfg_in(tmp_path)
+    days = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]
+    calls = []
+
+    def src(t, s, e):
+        calls.append((s, e))
+        if len(calls) == 1:
+            return frame([d for d in days if d != "2026-11-03"])
+        return frame(days)
+
+    fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 6), cfg, source=src)
+    out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 6), cfg, source=src)
+    assert len(calls) == 2 and calls[1][0] <= date(2026, 11, 3) <= calls[1][1]
+    assert len(out["A.NS"]) == 5
