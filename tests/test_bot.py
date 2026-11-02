@@ -296,3 +296,13 @@ def test_switch_strategy_starts_fresh_record(cfg, store):
     assert ev["from"] == "momentum" and ev["to"] == "other" and len(ev["trades"]) == 1
     assert ev["trades"][0]["ticker"] == "A.NS"
     assert store.get("last_processed_day") == "2024-01-02"
+
+
+def test_choose_records_paper_start_capital(cfg, store):
+    store.set("backtest_summary", summary("momentum", "other"))
+    cmd("/choose momentum", cfg, store)
+    assert store.get("paper_start_capital") == 20000
+    p = Portfolio(15000)
+    store.set("portfolio", p.to_dict())
+    cmd("/choose other", cfg, store)
+    assert store.get("paper_start_capital") == 15000

@@ -116,8 +116,9 @@ class _Day:
 
 
 def _paper_metrics(portfolio: Portfolio, history: dict[str, float], bars: Bars,
-                   cfg: Config) -> Metrics:
-    """Paper record vs buy-and-hold benchmark since paper start (Ruling R17).
+                   cfg: Config, start_capital: float | None = None) -> Metrics:
+    """Paper record vs buy-and-hold benchmark since paper start (Ruling R17), measured from the
+    cash the strategy started with (Ruling R25; config capital if unknown).
     Open positions are treated as sold at the last close for tax/costs, like backtests (R15)."""
     days = sorted(history)
     idx = pd.DatetimeIndex([pd.Timestamp(d) for d in days], name="date")
@@ -131,7 +132,8 @@ def _paper_metrics(portfolio: Portfolio, history: dict[str, float], bars: Bars,
         closes = bars[t]["close"]
         open_at_end.append(liquid.sell(t, float(closes[closes.index <= last].iloc[-1]),
                                        last.date(), "end of period", cfg))
-    return compute_metrics(list(portfolio.trades), equity, bench["close"], cfg.capital, cfg,
+    capital = float(start_capital) if start_capital else cfg.capital
+    return compute_metrics(list(portfolio.trades), equity, bench["close"], capital, cfg,
                            benchmark_open=float(bench["open"].iloc[0]) if not bench.empty else None,
                            open_at_end=open_at_end, liquidated_equity=liquid.cash)
 
@@ -397,10 +399,13 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
 
     def summary() -> None:
         last_r = traded[-1].result
+        # I3: exits and skipped orders from EVERY processed day, not just the last one.
+        exits = [tr for x in traded for tr in x.result.sells + x.result.stop_exits]
+        skipped = [(x.result.d, tk, why) for x in traded for tk, why in x.result.skipped]
         sender(reports.daily_summary(
             last_r.d, Portfolio.from_dict(traded[-1].portfolio), last_r.equity, last_r.new_signals,
-            last_r.sells + last_r.stop_exits, [x.result.d for x in traded[:-1]], name,
-            _below_benchmark(store, name), skipped=last_r.skipped, notes=notes), store)
+            exits, [x.result.d for x in traded[:-1]], name,
+            _below_benchmark(store, name), skipped=skipped, notes=notes), store)
 
     def weekly() -> None:
         week_ends = [x.result.d for x in traded if _last_day_of_week(x.result.d, cfg)]
@@ -413,7 +418,8 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
                 week_ends.append(prev[-1])
         week_ends.sort()
         if week_ends and store.get("last_weekly_week") != _week_key(week_ends[-1]):
-            metrics = _paper_metrics(Portfolio.from_dict(traded[-1].portfolio), history, bars, cfg)
+            metrics = _paper_metrics(Portfolio.from_dict(traded[-1].portfolio), history, bars, cfg,
+                                     store.get("paper_start_capital"))
             text = reports.weekly_report(metrics, name, _oos(store, name))
             sender(text, store)
             store.set("last_weekly_report", text)  # for the /report command (Ruling R19)

@@ -29,8 +29,11 @@ def alert(text: str) -> str:
 
 def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Signal],
                   exits: list[Trade], caught_up_days: list[date], strategy_name: str,
-                  below_benchmark: bool, skipped: list[tuple[str, str]] = (),
+                  below_benchmark: bool, skipped: list[tuple[date, str, str]] = (),
                   notes: list[str] = ()) -> str:
+    """`exits` and `skipped` cover every day processed in this run; after a catch-up each line
+    carries its date."""
+    dated = bool(caught_up_days)
     lines = [f"Daily summary {d.isoformat()} - strategy: {strategy_name}"]
     if below_benchmark:
         lines.append(f"{BELOW}: this strategy has been lagging a simple Nifty buy-and-hold.")
@@ -43,10 +46,11 @@ def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Si
     for p in portfolio.positions.values():
         lines.append(f"  {p.ticker}: {p.qty} shares, bought at {money(p.entry_price)}, stop {money(p.stop)}")
     if exits:
-        lines += ["", "Closed today:"]
+        lines += ["", "Closed since the last summary:" if dated else "Closed today:"]
         for t in exits:
             why = _EXIT_WHY.get(t.reason, t.reason)
-            lines.append(f"  {t.ticker}: {t.qty} shares sold at {money(t.exit_price)} ({why}), "
+            when = f"{t.exit_date.isoformat()} " if dated else ""
+            lines.append(f"  {when}{t.ticker}: {t.qty} shares sold at {money(t.exit_price)} ({why}), "
                          f"profit/loss {money(t.pnl)} after costs")
     lines += ["", "Orders for tomorrow's open:"]
     if signals:
@@ -60,7 +64,7 @@ def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Si
         lines.append("  No new orders.")
     if skipped:
         lines += ["", "Skipped orders:"]
-        lines += [f"  {t}: {why}" for t, why in skipped]
+        lines += [f"  {f'{d.isoformat()} ' if dated else ''}{t}: {why}" for d, t, why in skipped]
     return "\n".join(lines)
 
 

@@ -29,7 +29,7 @@ def test_daily_summary_lists_signal_with_stop_and_reason():
     t = Trade("ITC.NS", 10, date(2026, 10, 1), 400.0, date(2026, 11, 2), 380.0, 30.0, -230.0, "stop")
     txt = reports.daily_summary(date(2026, 11, 2), _pf(), 20000.0, sigs, [t],
                                 [date(2026, 10, 30)], "trend", False,
-                                skipped=[("WIPRO.NS", "gapped below stop")])
+                                skipped=[(date(2026, 11, 2), "WIPRO.NS", "gapped below stop")])
     for s in ["TCS.NS", "3,200", "20-day high breakout", "trend broke", "₹12,345", "₹20,000",
               "Caught up 1 missed day", "2026-10-30", "ITC.NS", "-₹230", "gapped below stop",
               "Open positions: 1"]:

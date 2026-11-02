@@ -128,6 +128,7 @@ def _choose(arg: str, cfg: Config, store: Store, today: date) -> str:
             store.set("equity_history", {})
         _bump_rev(store)
         store.set("portfolio", p.to_dict())
+        store.set("paper_start_capital", p.cash)  # Ruling R25: returns measured from here
         store.set("chosen_strategy", arg)
         store.set("last_processed_day", previous_trading_day(today, cfg).isoformat())
         store.log_event("choose", {"strategy": arg})

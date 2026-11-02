@@ -681,3 +681,36 @@ def test_commands_bump_state_rev(cfg, store):
         bot.handle_command(c, 1, cfg, store, today=TUE)
         revs.append(store.get("state_rev", 0))
     assert revs == [0, 1, 2, 2, 3, 3]
+
+
+# --- I2 / Ruling R25: paper returns measured from the cash the strategy started with --------
+
+def test_weekly_paper_return_uses_paper_start_capital(cfg, store, scripted):
+    start_paper(store, MON)
+    store.set("portfolio", Portfolio(15000.0).to_dict())
+    store.set("paper_start_capital", 15000.0)
+    s = Sender()
+    run(FRI, cfg, store, FakeFetch(flat_bars()), s)
+    (weekly,) = [m for m in s.messages if m.startswith("Weekly report")]
+    assert "Return: 0.0%" in weekly
+
+
+# --- I3: catch-up lists exits and skipped orders from every processed day ----------------
+
+def test_catch_up_summary_lists_earlier_exits_and_skips(cfg, store, scripted):
+    """Reviewer probe: a TUE stop-out was missing from the THU catch-up summary."""
+    bars = flat_bars()
+    a = bars["A.NS"].copy()
+    a.loc[pd.Timestamp(TUE), "low"] = 85.0  # bought at TUE open, stopped out the same day
+    a.loc[pd.Timestamp(WED), ["open", "low"]] = 89.0  # TUE's new BUY gaps below its stop on WED
+    bars["A.NS"] = a
+    scripted.buy_on = {MON}
+    start_paper(store, date(2023, 12, 29))
+    run(MON, cfg, store, FakeFetch(bars), Sender())
+    scripted.buy_on = {TUE}
+    s = Sender()
+    assert run(THU, cfg, store, FakeFetch(bars), s) == [TUE, WED, THU]
+    summary = s.messages[-1]
+    assert "Closed today" not in summary
+    assert f"{TUE.isoformat()} A.NS: " in summary and "stop-loss hit" in summary
+    assert f"{WED.isoformat()} A.NS: gapped below stop" in summary
