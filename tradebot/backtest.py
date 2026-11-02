@@ -199,10 +199,12 @@ def walk_forward(strategy_names: list[str], bars: Bars, cfg: Config,
 
 
 def rank(results: dict[str, dict[Segment, Metrics]], cfg: Config) -> list[str]:
-    """Best first, on out-of-sample metrics: drawdown within the kill-switch limit, then
-    higher expectancy, then higher return over the benchmark (name breaks exact ties)."""
+    """Best first, on out-of-sample metrics (Ruling R13): drawdown within the kill-switch limit
+    first (among breaches, lower drawdown first), then higher expectancy as % of position value,
+    then higher return over the benchmark; the name breaks exact ties."""
     def key(name: str):
         m = results[name]["out_of_sample"]
-        return (m.max_drawdown > cfg.kill_switch_dd_pct, -m.expectancy,
+        breaches = m.max_drawdown > cfg.kill_switch_dd_pct
+        return (breaches, m.max_drawdown if breaches else 0.0, -m.expectancy_pct,
                 -(m.total_return - m.benchmark_return), name)
     return sorted(results, key=key)

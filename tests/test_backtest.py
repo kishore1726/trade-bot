@@ -186,22 +186,35 @@ def test_walk_forward_splits_and_warms_up(cfg, monkeypatch):
     assert runs[0][-1] < runs[1][0]
 
 
-def _m(dd, exp, ret, bench=0.0):
-    return Metrics(trades=1, win_rate=0.5, avg_win=1, avg_loss=-1, expectancy=exp,
+def _m(dd, exp_pct, ret, bench=0.0, exp_rs=0.0):
+    return Metrics(trades=1, win_rate=0.5, avg_win=1, avg_loss=-1, expectancy=exp_rs,
                    max_drawdown=dd, total_return=ret, cagr=0, benchmark_return=bench,
                    benchmark_cagr=0, total_costs=0, post_tax_return=ret,
-                   benchmark_post_tax_return=bench, below_benchmark=ret < bench)
+                   benchmark_post_tax_return=bench, below_benchmark=ret < bench,
+                   expectancy_pct=exp_pct)
 
 
 def test_rank_order(cfg):
     ins = _m(0.1, 0, 0)
     results = {
-        "deep": {"in_sample": ins, "out_of_sample": _m(0.30, 500.0, 2.0)},  # breaches 15% dd
-        "lowexp": {"in_sample": ins, "out_of_sample": _m(0.10, 50.0, 0.9)},
-        "beatbench": {"in_sample": ins, "out_of_sample": _m(0.12, 100.0, 0.5, 0.1)},
-        "tie": {"in_sample": ins, "out_of_sample": _m(0.15, 100.0, 0.5, 0.3)},
+        "deep": {"in_sample": ins, "out_of_sample": _m(0.30, 0.05, 2.0)},  # breaches 15% dd
+        "lowexp": {"in_sample": ins, "out_of_sample": _m(0.10, 0.005, 0.9, exp_rs=900.0)},
+        "beatbench": {"in_sample": ins, "out_of_sample": _m(0.12, 0.01, 0.5, 0.1)},
+        "tie": {"in_sample": ins, "out_of_sample": _m(0.15, 0.01, 0.5, 0.3)},
     }
+    # within-limit first; then expectancy_pct (not rupees); then return over benchmark
     assert rank(results, cfg) == ["beatbench", "tie", "lowexp", "deep"]
+
+
+def test_rank_both_breach_lower_drawdown_first(cfg):
+    ins = _m(0.1, 0, 0)
+    results = {
+        "shrunk": {"in_sample": ins,
+                   "out_of_sample": _m(0.65, -0.02, -0.64, exp_rs=-45.0)},
+        "milder": {"in_sample": ins,
+                   "out_of_sample": _m(0.31, -0.03, -0.04, exp_rs=-57.0)},
+    }
+    assert rank(results, cfg) == ["milder", "shrunk"]
 
 
 

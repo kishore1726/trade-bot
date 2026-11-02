@@ -29,6 +29,7 @@ class Metrics:
     benchmark_post_tax_return: float
     below_benchmark: bool
     kill_switch_trips: int = 0  # backtest only: times the drawdown kill switch tripped
+    expectancy_pct: float = 0.0  # mean of pnl / (qty x entry_price): size-independent expectancy
 
     @classmethod
     def from_dict(cls, d: dict) -> "Metrics":
@@ -121,4 +122,5 @@ def compute_metrics(trades: list[Trade], equity: pd.Series, benchmark_close: pd.
         # Conservative: below if it trails the benchmark before OR after estimated tax.
         below_benchmark=bool(total_return < b_ret or post_tax_return < b_post),
         kill_switch_trips=int(kill_switch_trips),
+        expectancy_pct=float(sum(t.pnl / (t.qty * t.entry_price) for t in trades) / n) if n else 0.0,
     )

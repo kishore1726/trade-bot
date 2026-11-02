@@ -22,8 +22,8 @@ def cfg():
     )
 
 
-def trade(pnl, exit_date=date(2024, 6, 3), costs=10.0):
-    return Trade("A.NS", 10, date(2024, 6, 1), 100.0, exit_date, 100.0, costs, pnl, "signal")
+def trade(pnl, exit_date=date(2024, 6, 3), costs=10.0, qty=10, entry=100.0):
+    return Trade("A.NS", qty, date(2024, 6, 1), entry, exit_date, 100.0, costs, pnl, "signal")
 
 
 def series(values, start="2024-01-01"):
@@ -43,6 +43,14 @@ def test_win_rate_and_expectancy(cfg):
     assert m.avg_loss == pytest.approx(-100)
     assert m.expectancy == pytest.approx(33.33, abs=0.01)
     assert m.total_costs == pytest.approx(30.0)
+    assert m.expectancy_pct == pytest.approx((0.3 - 0.1 - 0.1) / 3)  # position value 1000
+
+
+def test_expectancy_pct_per_trade_position_value(cfg):
+    m = compute_metrics([trade(100, qty=10, entry=100.0), trade(-100, qty=2, entry=250.0)],
+                        series([20000, 20000]), flat_bench(2), 20000, cfg)
+    assert m.expectancy == pytest.approx(0.0)
+    assert m.expectancy_pct == pytest.approx((0.10 - 0.20) / 2)
 
 
 def test_max_drawdown(cfg):
@@ -52,7 +60,8 @@ def test_max_drawdown(cfg):
 
 def test_empty_trades_gives_zeros(cfg):
     m = compute_metrics([], series([20000, 20000]), flat_bench(2), 20000, cfg)
-    assert (m.trades, m.win_rate, m.avg_win, m.avg_loss, m.expectancy) == (0, 0.0, 0.0, 0.0, 0.0)
+    assert (m.trades, m.win_rate, m.avg_win, m.avg_loss, m.expectancy, m.expectancy_pct) == (
+        0, 0.0, 0.0, 0.0, 0.0, 0.0)
     assert m.total_return == 0.0 and m.max_drawdown == 0.0 and m.post_tax_return == 0.0
 
 
@@ -116,5 +125,5 @@ def test_metrics_round_trip(cfg):
     d = json.loads(json.dumps(asdict(m)))
     assert Metrics.from_dict(d) == m
     assert Metrics.from_dict(asdict(replace(m, trades=7))).trades == 7
-    m3 = replace(m, kill_switch_trips=3)
+    m3 = replace(m, kill_switch_trips=3, expectancy_pct=-0.0123)
     assert Metrics.from_dict(json.loads(json.dumps(asdict(m3)))) == m3
