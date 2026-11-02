@@ -41,6 +41,16 @@ def _log_traceback(what: str) -> Path:
     return path
 
 
+def _log_traceback_text(what: str) -> None:
+    try:
+        path = REPO / "logs" / "tradebot.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(f"--- {datetime.now(IST).isoformat(timespec='seconds')} {what}\n")
+    except OSError:
+        pass
+
+
 def _setup():
     load_env(REPO / ".env")
     cfg = load_config(REPO / "config.yaml")
@@ -55,8 +65,9 @@ def _today() -> date:
 def cmd_backtest(cfg, store, start: date) -> int:
     try:
         import yfinance  # noqa: F401  (it installs its own warning filter on import; silence it after)
-        warnings.simplefilter("ignore")  # yfinance prints pandas deprecation noise (CLI process only)
-        bars = fetch_bars(sorted(set(cfg.universe) | {cfg.benchmark}), start, _today(), cfg)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # yfinance prints pandas deprecation noise
+            bars = fetch_bars(sorted(set(cfg.universe) | {cfg.benchmark}), start, _today(), cfg)
     except Exception:
         _log_traceback("backtest: market data download failed")
         print("Could not download market data. Check your internet connection and try again. "
@@ -113,7 +124,8 @@ def build_plist(which: str, python: str, repo: Path) -> dict:
 
 
 def _default_runner(cmd, **kw):
-    return subprocess.run(cmd, check=False, **kw)
+    """Run a command, capturing its output so launchctl's chatter never reaches the owner."""
+    return subprocess.run(cmd, check=False, capture_output=True, text=True, **kw)
 
 
 def _default_target() -> Path:
@@ -128,8 +140,15 @@ def install_schedule(target: Path | None = None, runner=_default_runner,
     for which in LABELS:
         path = target / f"{LABELS[which]}.plist"
         path.write_bytes(plistlib.dumps(build_plist(which, python, repo)))
-        runner(["launchctl", "unload", str(path)])  # harmless if not loaded yet (re-install)
-        runner(["launchctl", "load", str(path)])
+        runner(["launchctl", "unload", str(path)])  # harmless if not loaded yet (re-install); output hidden
+        result = runner(["launchctl", "load", str(path)])
+        if getattr(result, "returncode", 0) != 0:
+            detail = (getattr(result, "stderr", "") or "").strip()
+            _log_traceback_text(f"launchctl load failed for {path}: {detail}")
+            print(f"Could not start the {which} job (macOS refused to load it). Nothing is scheduled "
+                  "yet. Details are in logs/tradebot.log. Make sure the bot folder is in your home "
+                  "folder (not Desktop, Documents or Downloads) and try again.", file=sys.stderr)
+            return 1
     print("Schedule installed. The bot now runs by itself: a daily run at 16:30 on weekdays "
           "(plus catch-up when your Mac wakes) and the Telegram command bot.")
     print("To stop everything later: tradebot uninstall-schedule")

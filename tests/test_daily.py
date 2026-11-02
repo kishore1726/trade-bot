@@ -459,3 +459,16 @@ def test_weekly_report_text_is_stored_for_report_command(cfg, store, scripted):
     run(FRI, cfg, store, fetch, sender)
     weekly = [m for m in sender.messages if "Weekly report" in m]
     assert store.get("last_weekly_report") == weekly[0]
+
+
+def test_alerts_deduplicated_per_ist_day(cfg, store, scripted):
+    start_paper(store, MON)
+    fetch, sender = FakeFetch(flat_bars(), error=ConnectionError("down")), Sender()
+    run(THU, cfg, store, fetch, sender)
+    run(THU, cfg, store, fetch, sender)
+    assert len(sender.messages) == 1
+    assert list(store.get("last_alerts")) == [THU.isoformat()]
+    FRI = THU + timedelta(days=1)
+    run(FRI, cfg, store, fetch, sender)
+    assert len(sender.messages) == 2
+    assert list(store.get("last_alerts")) == [FRI.isoformat()]

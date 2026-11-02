@@ -110,3 +110,17 @@ def test_backtest_fetch_error_is_plain(monkeypatch, tmp_path, capsys):
     err = capsys.readouterr().err
     assert "download" in err and "Traceback" not in err
     assert "RuntimeError" in (tmp_path / "logs" / "tradebot.log").read_text()
+
+
+def test_install_schedule_reports_launchctl_failure(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    monkeypatch.setattr(cli, "REPO", tmp_path)
+
+    def runner(cmd, **kw):
+        return SimpleNamespace(returncode=5 if cmd[1] == "load" else 3, stderr="Load failed: 5")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert cli.install_schedule(tmp_path / "LA", runner, python="/v/bin/python", repo=repo) == 1
+    cap = capsys.readouterr()
+    assert "installed" not in cap.out and "Could not start" in cap.err
+    assert "Load failed" in (tmp_path / "logs" / "tradebot.log").read_text()

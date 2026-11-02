@@ -8,7 +8,13 @@ You do not need to know programming. Follow the steps in order. Commands are typ
 
 ### Step 1. Install
 
-In Terminal, go to the bot's folder (the one containing this README), then type these one at a time:
+You need Python 3.10 or newer. Check with `python3 --version`. If it shows something older (or "command not found"), install the latest Python from https://www.python.org/downloads/ first.
+
+Keep the bot's folder directly in your home folder (for example `~/trading-bot`), **not** in Desktop, Documents or Downloads: macOS blocks background jobs from reading those folders.
+
+In Terminal, go to the folder and type these one at a time:
+
+    cd ~/trading-bot
 
     python3 -m venv .venv
     source .venv/bin/activate
@@ -55,17 +61,17 @@ You should get "Hello from your trading bot" on your phone. If it says the messa
 
 This replays about ten years of past prices through both strategies (this can take a few minutes and needs internet). The comparison is printed on screen and sent to Telegram.
 
-### Step 7. Choose a strategy
-
-In Telegram, reply to your bot with `/choose trend` or `/choose meanrev` (use the name from the comparison). Paper trading starts from the next trading day. The Telegram command bot must be running for this to work, so you may do Step 8 first and then choose.
-
-### Step 8. Make it run by itself
+### Step 7. Make it run by itself
 
     tradebot install-schedule
 
-After this the bot runs on its own every weekday at 16:30 and listens to your Telegram commands. You can close Terminal.
+After this the bot runs on its own every weekday at 16:30 and listens to your Telegram commands. You can close Terminal. If it prints an error instead of "Schedule installed", the schedule is NOT active; see the logs folder.
 
 **Your Mac must be switched on** (it may be asleep, but not shut down). If it was asleep or off at 16:30, the bot catches up by itself when the Mac wakes; days are never processed twice.
+
+### Step 8. Choose a strategy
+
+Now that the bot is listening, reply to it in Telegram with `/choose trend` or `/choose meanrev` (use a name from the backtest comparison). **No paper trades happen until you do this.** Paper trading then starts from the next trading day.
 
 ## What the Telegram messages mean
 
@@ -83,6 +89,10 @@ After this the bot runs on its own every weekday at 16:30 and listens to your Te
 - `/resume` - allow new buys again (this also clears the kill switch).
 - `/choose <name>` - pick the strategy to paper trade, e.g. `/choose trend`.
 - `/help` - list of commands.
+
+## If something goes wrong
+
+Look in the `logs` folder inside the bot's folder (especially `tradebot.log`). It records what failed. The same warning is sent to Telegram at most once a day.
 
 ## How to stop everything
 

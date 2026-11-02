@@ -13,6 +13,7 @@ Runs unattended. Rules:
 from __future__ import annotations
 
 import copy
+import hashlib
 import traceback
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
@@ -59,6 +60,21 @@ def _log_exception(cfg: Config, what: str) -> None:
 def _ist(now: Callable[[], datetime] | None) -> datetime:
     t = (now or (lambda: datetime.now(IST)))()
     return t.astimezone(IST) if t.tzinfo else t.replace(tzinfo=IST)
+
+
+def _dedup(sender, store: Store, now: Callable[[], datetime] | None):
+    """Ruling R21: the same alert text goes out at most once per IST calendar day, so the hourly
+    catch-up run cannot spam the owner. Only alerts (starting with the warning sign) are checked."""
+    def send_once(text, st):
+        if text.startswith(reports.alert("")):
+            day = _ist(now).date().isoformat()
+            digest = hashlib.sha1(text.encode()).hexdigest()
+            seen = (store.get("last_alerts") or {}).get(day, [])
+            if digest in seen:
+                return False
+            store.set("last_alerts", {day: seen + [digest]})
+        return sender(text, st)
+    return send_once
 
 
 def _week_key(d: date) -> str:
@@ -131,6 +147,7 @@ def run_daily(today: date, cfg: Config, store: Store, fetch=fetch_bars, sender=s
     """Process every trading day after "last_processed_day" up to `today` (today only after
     16:15 IST). Returns the days processed. Never raises."""
     committed: list[date] = []  # days already saved, even if a later step fails
+    sender = _dedup(sender, store, now)
     try:
         return _run(today, cfg, store, fetch, sender, now, committed)
     except Exception:
