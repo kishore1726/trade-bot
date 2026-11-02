@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.tradebot.bot</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/PATH/TO/trading-bot/.venv/bin/python</string>
+		<string>-m</string>
+		<string>tradebot.cli</string>
+		<string>bot</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/PATH/TO/trading-bot/logs/bot.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/PATH/TO/trading-bot/logs/bot.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>/PATH/TO/trading-bot</string>
+</dict>
+</plist>
