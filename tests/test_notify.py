@@ -46,7 +46,7 @@ def test_send_flushes_backlog_in_order(store, monkeypatch):
     assert store.outbox_pending() == []
     assert "botTOK/sendMessage" in seen[0][0]
     assert "first" in seen[0][1] and "second" in seen[1][1]
-    assert "chat_id=42" in seen[0][1] or '"chat_id": "42"' in seen[0][1] or "42" in seen[0][1]
+    assert "chat_id=42" in seen[0][1]
 
 
 def test_flush_stops_at_first_failure(store, monkeypatch):
@@ -94,3 +94,24 @@ def test_load_env_does_not_override(tmp_path, monkeypatch):
     assert os.environ["TELEGRAM_TOKEN"] == "existing"
     assert os.environ["TELEGRAM_CHAT_ID"] == "99"
     notify.load_env(tmp_path / "missing.env")  # no error
+
+
+def test_token_never_logged(store, monkeypatch):
+    _env(monkeypatch)
+
+    def boom(request):
+        raise httpx.ConnectError(f"failed for {request.url}")
+
+    assert notify.send("x", store, _client(boom)) is False
+    ev = store.events("telegram_error")
+    assert ev and "TOK" not in str(ev)
+
+
+def test_send_never_raises_on_sqlite_error(store, monkeypatch):
+    _env(monkeypatch)
+
+    def bad(text):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(store, "outbox_add", bad)
+    assert notify.send("x", store, _client(lambda r: httpx.Response(200))) is False

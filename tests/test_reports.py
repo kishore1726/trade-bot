@@ -65,3 +65,20 @@ def test_weekly_report_has_win_rate_avg_win_loss_drawdown():
 
 def test_alert_prefix():
     assert reports.alert("data is stale").startswith("⚠️ ")
+
+
+def test_unknown_exit_reason_shown_raw():
+    t = Trade("ITC.NS", 1, date(2026, 10, 1), 400.0, date(2026, 11, 2), 380.0, 3.0, -23.0, "time_exit")
+    txt = reports.daily_summary(date(2026, 11, 2), _pf(), 1.0, [], [t], [], "trend", False)
+    assert "(time_exit)" in txt and "strategy sell signal" not in txt
+    t.reason = "signal"
+    assert "strategy sell signal" in reports.daily_summary(date(2026, 11, 2), _pf(), 1.0, [], [t], [], "trend", False)
+
+
+def test_weekly_zero_trades_and_comparison_caveat():
+    assert "No closed trades yet" in reports.weekly_report(_m(trades=0, win_rate=0.0), "trend")
+    assert "Win rate: 0.0%" not in reports.weekly_report(_m(trades=0, win_rate=0.0), "trend")
+    res = {"trend": {"in_sample": _m(), "out_of_sample": _m()}}
+    assert "can mislead" in reports.backtest_comparison(res, ["trend"])
+    w = reports.weekly_report(_m(), "trend", _m(win_rate=0.5))
+    assert "paper 40.0% / backtest 50.0%" in w

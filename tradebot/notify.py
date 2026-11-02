@@ -43,7 +43,21 @@ def _chunks(text: str) -> list[str]:
 
 
 def send(text: str, store: Store, http: httpx.Client | None = None) -> bool:
-    """Queue `text`, then deliver the whole backlog in order. True only if all sent."""
+    """Queue `text`, then deliver the whole backlog in order. True only if all sent.
+
+    Never raises: any failure (network, HTTP, SQLite) returns False.
+    """
+    try:
+        return _send(text, store, http)
+    except Exception as exc:
+        try:
+            store.log_event("telegram_error", {"error": f"{type(exc).__name__}"})
+        except Exception:
+            pass
+        return False
+
+
+def _send(text: str, store: Store, http: httpx.Client | None) -> bool:
     for part in _chunks(text):
         store.outbox_add(part)
     token = os.environ.get("TELEGRAM_TOKEN")

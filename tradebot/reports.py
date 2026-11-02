@@ -11,6 +11,10 @@ BELOW = "BELOW BENCHMARK"
 CHOOSE_LINE = "Reply /choose <name> to start paper trading."
 
 
+_EXIT_WHY = {"stop": "stop-loss hit", "signal": "strategy sell signal"}
+CAVEAT = "Win rate alone can mislead: a few big wins can beat many small losses."
+
+
 def _rs(x: float) -> str:
     return f"{'-' if round(x) < 0 else ''}₹{abs(x):,.0f}"
 
@@ -39,7 +43,7 @@ def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Si
     if exits:
         lines += ["", "Closed today:"]
         for t in exits:
-            why = "stop-loss hit" if t.reason == "stop" else "strategy sell signal"
+            why = _EXIT_WHY.get(t.reason, t.reason)
             lines.append(f"  {t.ticker}: {t.qty} shares sold at {_rs(t.exit_price)} ({why}), "
                          f"profit/loss {_rs(t.pnl)} after costs")
     lines += ["", "Orders for tomorrow's open:"]
@@ -69,7 +73,8 @@ def weekly_report(metrics: Metrics, strategy_name: str, backtest_oos: Metrics | 
         lines.append(f"{BELOW}: lagging a simple Nifty buy-and-hold.")
     lines += [
         f"Closed trades: {m.trades}",
-        f"Win rate: {_pct(m.win_rate)} (win rate alone can mislead: a few big wins can beat many small losses)",
+        f"Win rate: {_pct(m.win_rate)}" if m.trades else "No closed trades yet",
+        CAVEAT,
         f"Average win: {_rs(m.avg_win)}, average loss: {_rs(m.avg_loss)}",
         f"Average profit per trade: {_rs(m.expectancy)}",
         f"Worst fall from a peak: {_pct(m.max_drawdown)}",
@@ -80,9 +85,9 @@ def weekly_report(metrics: Metrics, strategy_name: str, backtest_oos: Metrics | 
     if backtest_oos is not None:
         b = backtest_oos
         lines.append(
-            f"Paper vs backtest: win rate {_pct(m.win_rate)} vs {_pct(b.win_rate)}, "
-            f"profit per trade {_rs(m.expectancy)} vs {_rs(b.expectancy)}, "
-            f"worst fall {_pct(m.max_drawdown)} vs {_pct(b.max_drawdown)}")
+            f"Paper vs backtest: win rate paper {_pct(m.win_rate)} / backtest {_pct(b.win_rate)}, "
+            f"profit per trade paper {_rs(m.expectancy)} / backtest {_rs(b.expectancy)}, "
+            f"worst fall paper {_pct(m.max_drawdown)} / backtest {_pct(b.max_drawdown)}")
     return "\n".join(lines)
 
 
@@ -104,6 +109,6 @@ def backtest_comparison(results: dict[str, dict[str, Metrics]], ranking: list[st
             f"  Earlier (in-sample) period: {_vs_bench(ins)}",
             "",
         ]
-    lines += ["Note: history uses today's Nifty 50 list, so past results look better than reality.", "",
+    lines += [CAVEAT, "Note: history uses today's Nifty 50 list, so past results look better than reality.", "",
               CHOOSE_LINE]
     return "\n".join(lines)
