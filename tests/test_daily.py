@@ -184,29 +184,87 @@ def test_idempotent_same_day(cfg, store, scripted):
 
 
 def test_bad_data_halts_and_alerts(cfg, store, scripted):
+    """A missing benchmark bar still halts (Ruling R26), with specific advice."""
     start_paper(store, MON)
     bars = flat_bars()
-    bars["B.NS"] = bars["B.NS"].drop(pd.Timestamp(WED))
+    bars[BENCH] = bars[BENCH].drop(pd.Timestamp(WED))
     fetch, sender = FakeFetch(bars), Sender()
     assert run(THU, cfg, store, fetch, sender) == [TUE]
     assert store.get("last_processed_day") == TUE.isoformat()
     assert sorted(store.get("equity_history")) == [TUE.isoformat()]
-    alerts = [m for m in sender.messages if "B.NS" in m]
+    alerts = [m for m in sender.messages if BENCH in m]
     assert len(alerts) == 1 and WED.isoformat() in alerts[0]
+    assert "benchmark" in alerts[0] and "config.yaml" in alerts[0]
     assert "Traceback" not in alerts[0]
     # Data fixed later: the next run resumes from Wed.
     fetch2 = FakeFetch(flat_bars())
     assert run(THU, cfg, store, fetch2, sender) == [WED, THU]
 
 
-def test_missing_ticker_in_fetch_result_is_bad_data(cfg, store, scripted):
+def test_bad_bar_on_any_ticker_still_halts(cfg, store, scripted):
+    start_paper(store, MON)
+    bars = flat_bars()
+    b = bars["B.NS"].copy()
+    b.loc[pd.Timestamp(WED), "low"] = 200.0  # low above open/close: broken bar
+    bars["B.NS"] = b
+    sender = Sender()
+    assert run(THU, cfg, store, FakeFetch(bars), sender) == [TUE]
+    assert any("B.NS" in m and "inconsistent" in m for m in sender.messages)
+
+
+def test_missing_ticker_in_fetch_result_is_skipped(cfg, store, scripted):
     start_paper(store, MON)
     bars = flat_bars()
     del bars["B.NS"]
     sender = Sender()
-    assert run(TUE, cfg, store, FakeFetch(bars), sender) == []
-    assert store.get("last_processed_day") == MON.isoformat()
-    assert len(sender.messages) == 1 and "B.NS: no data" in sender.messages[0]
+    assert run(WED, cfg, store, FakeFetch(bars), sender, now=lambda: datetime(2024, 1, 3, 21, tzinfo=IST)) == [TUE, WED]
+    (alert,) = [m for m in sender.messages if m.startswith("⚠️")]
+    assert "B.NS has had no data at all" in alert and "config.yaml" in alert
+
+
+# --- I4 / Ruling R26: one permanently missing ticker must not block all trading ------------
+
+def test_missing_unheld_ticker_is_skipped_for_the_day(cfg, store, scripted, monkeypatch):
+    start_paper(store, MON)
+    bars = flat_bars()
+    bars["B.NS"] = bars["B.NS"][bars["B.NS"].index <= pd.Timestamp(TUE)]  # B stops trading
+    seen = {}
+    real = daily.step_day
+
+    def step(state, d, b, strategy, cfg):
+        seen[d] = sorted(b)
+        return real(state, d, b, strategy, cfg)
+    monkeypatch.setattr(daily, "step_day", step)
+    late = lambda: datetime(2024, 1, 4, 21, 0, tzinfo=IST)
+    s = Sender()
+    assert run(THU, cfg, store, FakeFetch(bars), s, now=late) == [TUE, WED, THU]
+    assert run(THU, cfg, store, FakeFetch(bars), s, now=late) == []
+    assert "B.NS" in seen[TUE] and "B.NS" not in seen[WED] and "B.NS" not in seen[THU]
+    alerts = [m for m in s.messages if m.startswith("⚠️")]
+    assert len(alerts) == 1  # once per day (R21)
+    assert ("B.NS has had no data since 2024-01-02. If it was renamed or left the index, "
+            "remove it from config.yaml under universe.") in alerts[0]
+
+
+def test_missing_held_ticker_still_halts(cfg, store, scripted):
+    start_paper(store, MON)
+    _hold_a(cfg, store)
+    bars = flat_bars()
+    bars["A.NS"] = bars["A.NS"].drop(pd.Timestamp(WED))
+    s = Sender()
+    assert run(THU, cfg, store, FakeFetch(bars), s) == [TUE]
+    (alert,) = s.messages[1:]
+    assert "A.NS" in alert and "holds" in alert and WED.isoformat() in alert
+
+
+def test_most_tickers_missing_halts(cfg, store, scripted):
+    start_paper(store, MON)
+    bars = flat_bars()
+    for t in TICKERS:
+        bars[t] = bars[t].drop(pd.Timestamp(WED))
+    s = Sender()
+    assert run(THU, cfg, store, FakeFetch(bars), s) == [TUE]
+    assert any("looks wrong" in m for m in s.messages)
 
 
 def test_fetch_failure_alerts_and_does_not_advance(cfg, store, scripted):

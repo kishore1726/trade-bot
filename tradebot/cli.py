@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import plistlib
 import subprocess
 import sys
@@ -10,6 +12,8 @@ import warnings
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
+
+import httpx
 
 from tradebot.backtest import rank, walk_forward
 from tradebot.bot import run_bot
@@ -51,15 +55,52 @@ def _log_traceback_text(what: str) -> None:
         pass
 
 
+class ConfigProblem(Exception):
+    """config.yaml could not be read; the message is a short plain-English reason."""
+
+
 def _setup():
     load_env(REPO / ".env")
-    cfg = load_config(REPO / "config.yaml")
+    try:
+        cfg = load_config(REPO / "config.yaml")
+    except FileNotFoundError as exc:
+        raise ConfigProblem("the file is missing") from exc
+    except Exception as exc:
+        raise ConfigProblem((str(exc).strip().splitlines() or [type(exc).__name__])[0][:150]) from exc
     cfg.state_path.parent.mkdir(parents=True, exist_ok=True)
     return cfg, Store(cfg.state_path)
 
 
 def _today() -> date:
     return datetime.now(IST).date()
+
+
+def _post(url: str, data: dict) -> None:
+    httpx.post(url, data=data, timeout=10)
+
+
+def _startup_alert(exc: Exception) -> None:
+    """I5: the unattended jobs failed before they could start; tell the owner on Telegram using
+    only .env. At most once a day per text (launchd restarts the bot and reruns the daily job).
+    Never raises."""
+    try:
+        load_env(REPO / ".env")
+        token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+        if not token or not chat:
+            return
+        if isinstance(exc, ConfigProblem):
+            text = f"⚠️ I couldn't start: config.yaml has a problem ({exc}). Details in the logs folder."
+        else:
+            text = f"⚠️ I couldn't start ({type(exc).__name__}). Details in the logs folder."
+        marker = REPO / "logs" / "startup_alert.txt"
+        key = f"{_today().isoformat()} {hashlib.sha1(text.encode()).hexdigest()}"
+        if marker.exists() and marker.read_text().strip() == key:
+            return
+        _post(f"https://api.telegram.org/bot{token}/sendMessage", {"chat_id": chat, "text": text})
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(key)
+    except Exception:
+        pass
 
 
 def cmd_backtest(cfg, store, start: date) -> int:
@@ -187,7 +228,16 @@ def main(argv: list[str] | None = None) -> int:
             return install_schedule()
         if args.command == "uninstall-schedule":
             return uninstall_schedule()
-        cfg, store = _setup()
+        try:
+            cfg, store = _setup()
+        except Exception as exc:
+            log = _log_traceback(f"command {args.command} could not start")
+            if args.command in ("run-daily", "bot"):
+                _startup_alert(exc)
+            reason = str(exc) if isinstance(exc, ConfigProblem) else type(exc).__name__
+            print(f"Could not start: config.yaml or .env has a problem ({reason}). "
+                  f"Details are in {log}", file=sys.stderr)
+            return 1
         if args.command == "backtest":
             return cmd_backtest(cfg, store, args.start)
         handler = {"run-daily": cmd_run_daily, "bot": cmd_bot, "test-telegram": cmd_test_telegram}

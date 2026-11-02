@@ -124,3 +124,42 @@ def test_install_schedule_reports_launchctl_failure(tmp_path, monkeypatch, capsy
     cap = capsys.readouterr()
     assert "installed" not in cap.out and "Could not start" in cap.err
     assert "Load failed" in (tmp_path / "logs" / "tradebot.log").read_text()
+
+
+# --- I5: a broken config.yaml still reaches Telegram -------------------------------------
+
+@pytest.fixture
+def broken_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "REPO", tmp_path)
+    monkeypatch.setenv("TELEGRAM_TOKEN", "TOK")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+
+    def bad(path):
+        raise ValueError("missing config setting: capital")
+    monkeypatch.setattr(cli, "load_config", bad)
+    posts = []
+    monkeypatch.setattr(cli, "_post", lambda url, data: posts.append((url, data)), raising=False)
+    return posts
+
+
+def test_config_error_is_sent_to_telegram_once_a_day(broken_config, capsys):
+    assert cli.main(["run-daily"]) == 1
+    (url, data) = broken_config[0]
+    assert url.endswith("botTOK/sendMessage") and data["chat_id"] == "42"
+    assert data["text"] == ("⚠️ I couldn't start: config.yaml has a problem (missing config "
+                            "setting: capital). Details in the logs folder.")
+    assert cli.main(["bot"]) == 1  # same text, same day: not repeated (launchd restarts the bot)
+    assert len(broken_config) == 1
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_config_error_not_sent_for_interactive_commands(broken_config):
+    assert cli.main(["backtest"]) == 1
+    assert broken_config == []
+
+
+def test_startup_alert_never_raises(broken_config, monkeypatch):
+    def boom(url, data):
+        raise OSError("offline")
+    monkeypatch.setattr(cli, "_post", boom, raising=False)
+    assert cli.main(["run-daily"]) == 1

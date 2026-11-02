@@ -161,25 +161,34 @@ def fetch_bars(
     return out
 
 
+MISSING, BAD = "missing", "bad"
+
+
+def day_problems(bars: Bars, d: date) -> dict[str, tuple[str, str]]:
+    """{ticker: (kind, message)} for trading day d; tickers without a problem are left out.
+
+    kind MISSING: there is no usable bar for d (the ticker can be left out for the day);
+    kind BAD: a bar that cannot be trusted (never trade on it)."""
+    out: dict[str, tuple[str, str]] = {}
+    ts = pd.Timestamp(d)
+    for t, df in bars.items():
+        if df is None or df.empty:
+            out[t] = (MISSING, "no data")
+        elif df.index.duplicated().any():
+            out[t] = (BAD, "duplicate dates in data")
+        elif ts not in df.index:
+            out[t] = (MISSING, f"missing bar for {d}")
+        else:
+            row = df.loc[ts]
+            if row[["open", "high", "low", "close"]].isna().any():
+                out[t] = (BAD, f"NaN price on {d}")
+            elif row["low"] > min(row["open"], row["close"]) or row["high"] < max(row["open"], row["close"]):
+                out[t] = (BAD, f"inconsistent open/high/low/close on {d}")
+    return out
+
+
 def validate_day(bars: Bars, d: date) -> list[str]:
     """Return problems found for trading day d (empty list = data OK)."""
     if not bars:
         return ["no market data at all"]
-    problems: list[str] = []
-    ts = pd.Timestamp(d)
-    for t, df in bars.items():
-        if df is None or df.empty:
-            problems.append(f"{t}: no data")
-            continue
-        if df.index.duplicated().any():
-            problems.append(f"{t}: duplicate dates in data")
-        if ts not in df.index:
-            problems.append(f"{t}: missing bar for {d}")
-            continue
-        row = df.loc[[ts]].iloc[-1]
-        if row[["open", "high", "low", "close"]].isna().any():
-            problems.append(f"{t}: NaN price on {d}")
-            continue
-        if row["low"] > min(row["open"], row["close"]) or row["high"] < max(row["open"], row["close"]):
-            problems.append(f"{t}: inconsistent open/high/low/close on {d}")
-    return problems
+    return [f"{t}: {msg}" for t, (_, msg) in day_problems(bars, d).items()]

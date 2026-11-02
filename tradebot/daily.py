@@ -27,7 +27,7 @@ from tradebot.backtest import DayResult, DayState, step_day
 from tradebot.calendar import (HolidayFileError, is_trading_day, previous_trading_day,
                                trading_days_between)
 from tradebot.config import Config
-from tradebot.data import Bars, fetch_bars, validate_day
+from tradebot.data import BAD, Bars, day_problems, fetch_bars
 from tradebot.metrics import Metrics, compute_metrics
 from tradebot.notify import send
 from tradebot.portfolio import Portfolio
@@ -113,6 +113,7 @@ class _Day:
     pending: list[dict] | None = None
     kill_switch: bool = False
     holiday: date | None = None
+    left_out: dict[str, date | None] | None = None  # Ruling R26: ticker -> last bar before
 
 
 def _paper_metrics(portfolio: Portfolio, history: dict[str, float], bars: Bars,
@@ -276,6 +277,59 @@ def _unlisted_holiday(d: date, tickers: list[str], bars: Bars, cfg: Config) -> b
     return bench is not None and bool((bench.index > ts).any())
 
 
+def _left_out_text(left_out: dict[str, date | None]) -> str:
+    lines = []
+    for x, since in left_out.items():
+        when = f"since {since.isoformat()}" if since else "at all"
+        lines.append(f"{x} has had no data {when}. If it was renamed or left the index, remove "
+                     "it from config.yaml under universe.")
+    lines.append("I left it out for those days and traded the other stocks as normal."
+                 if len(left_out) == 1 else
+                 "I left them out for those days and traded the other stocks as normal.")
+    return reports.alert("\n".join(lines))
+
+
+def _critical_text(d: date, tickers: list[str], cfg: Config) -> str:
+    """Ruling R26: a missing benchmark or held ticker still halts, with specific advice."""
+    lines = []
+    for x in tickers:
+        if x == cfg.benchmark:
+            lines.append(f"The benchmark {x} has no price for {d.isoformat()}. If this lasts more "
+                         "than a day, check that \"benchmark\" in config.yaml is right.")
+        else:
+            lines.append(f"{x} has no price for {d.isoformat()} and the paper portfolio holds it. "
+                         "If this lasts several days the stock may be suspended or renamed: check "
+                         "it on the NSE website.")
+    lines.append(f"Nothing was traded for {d.isoformat()} (or any later day). I'll try again on "
+                 "the next run.")
+    return reports.alert("\n".join(lines))
+
+
+def _check_day(d: date, tickers: list[str], bars: Bars, held: set[str],
+               cfg: Config) -> tuple[str | None, dict[str, date | None]]:
+    """(halt alert text or None, tickers to leave out for d with their last bar date)."""
+    ts = pd.Timestamp(d)
+    empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"],
+                         index=pd.DatetimeIndex([]), dtype=float)
+    probs = day_problems({x: bars.get(x, empty) for x in tickers}, d)
+    lines = [f"{x}: {msg}" for x, (_, msg) in probs.items()]
+    if any(kind == BAD for kind, _ in probs.values()):
+        return _problems_text(d, lines), {}
+    missing = list(probs)
+    if not missing:
+        return None, {}
+    critical = [x for x in missing if x in held or x == cfg.benchmark]
+    if critical:
+        return _critical_text(d, critical, cfg), {}
+    if len(tickers) - len(missing) <= len(tickers) / 2:
+        return _problems_text(d, lines), {}
+    left_out = {}
+    for x in missing:
+        idx = bars[x].index[bars[x].index < ts] if x in bars else pd.DatetimeIndex([])
+        left_out[x] = idx[-1].date() if len(idx) else None
+    return None, left_out
+
+
 def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[date]:
     _holiday_file_check(today, cfg, store, sender)
     name = store.get("chosen_strategy")
@@ -337,18 +391,18 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
     # Compute every day in memory first (pure), so an error here changes nothing stored.
     strategy = REGISTRY[name]()
     done: list[_Day] = []
-    bad: tuple[date, list[str]] | None = None
+    bad: str | None = None  # alert text when a day cannot be processed
     for d in days:
         if _unlisted_holiday(d, tickers, bars, cfg):
             done.append(_Day(None, holiday=d))
             continue
-        problems = [f"{x}: no data" for x in tickers if x not in bars] + validate_day(bars, d)
-        if problems:
-            bad = (d, problems)
+        bad, left_out = _check_day(d, tickers, bars, set(state.portfolio.positions), cfg)
+        if bad:
             break
-        r = step_day(state, d, bars, strategy, cfg)
+        day_bars = {k: v for k, v in bars.items() if k not in left_out}
+        r = step_day(state, d, day_bars, strategy, cfg)
         done.append(_Day(r, state.portfolio.to_dict(), [asdict(s) for s in state.pending],
-                         state.kill_switch))
+                         state.kill_switch, left_out=left_out))
 
     saved: list[_Day] = []
     for day in done:
@@ -432,8 +486,14 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
         phase("weekly report", weekly)
     elif notes:
         phase("holiday note", lambda: sender("\n".join(notes), store))
+    left_out: dict[str, date | None] = {}
+    for x in traded:
+        for k, v in (x.left_out or {}).items():
+            left_out.setdefault(k, v)
+    if left_out:
+        phase("left-out alert", lambda: sender(_left_out_text(left_out), store))
     if bad is not None and not stopped:
-        phase("bad-data alert", lambda: sender(_problems_text(*bad), store))
+        phase("bad-data alert", lambda: sender(bad, store))
     if failed:
         if committed:
             sender(reports.alert(_partial_text(committed)), store)
