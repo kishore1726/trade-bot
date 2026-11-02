@@ -246,6 +246,25 @@ def _apply_adjustments(store: Store, adj: dict[str, float]) -> list[str]:
     return notes
 
 
+class _StateChanged(Exception):
+    """An owner command changed the stored state while this run was computing (Ruling R24)."""
+
+
+def _save_day(store: Store, day: _Day, history: dict[str, float]) -> None:
+    """Write one processed day (caller holds the transaction)."""
+    r = day.result
+    history[r.d.isoformat()] = r.equity
+    store.set("portfolio", day.portfolio)
+    store.set("pending_signals", day.pending)
+    store.set("kill_switch", day.kill_switch)
+    store.set("equity_history", history)
+    store.set("last_processed_day", r.d.isoformat())
+    store.log_event("paper_day", {
+        "day": r.d.isoformat(), "equity": r.equity, "buys": r.buys,
+        "sells": [x.ticker for x in r.sells], "stops": [x.ticker for x in r.stop_exits],
+        "skipped": [list(x) for x in r.skipped], "kill_tripped": r.kill_tripped_today})
+
+
 def _unlisted_holiday(d: date, tickers: list[str], bars: Bars, cfg: Config) -> bool:
     """Ruling R22: no ticker has a bar on d, but the benchmark has a bar on a later day."""
     ts = pd.Timestamp(d)
@@ -268,20 +287,21 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
                      f"traded. Send /choose <name> with one of: {', '.join(sorted(REGISTRY))}.")
         return []
 
-    last = store.get("last_processed_day")
-    last = date.fromisoformat(last) if last else previous_trading_day(today, cfg)
+    last_raw = store.get("last_processed_day")
+    last = date.fromisoformat(last_raw) if last_raw else previous_trading_day(today, cfg)
     days = trading_days_between(last + timedelta(days=1), today, cfg)
     t = _ist(now)
     days = [d for d in days if d < t.date() or (d == t.date() and t.time() >= RUN_AFTER)]
     if not days:
         return []
 
+    # This first read only decides what to download; everything used for trading is read again
+    # after the download (Ruling R24), since the owner may send a command meanwhile.
     raw = store.get("portfolio")
-    portfolio = Portfolio.from_dict(raw) if raw else Portfolio(cfg.capital)
-    history: dict[str, float] = dict(store.get("equity_history") or {})
-    paper_start = min([days[0]] + [date.fromisoformat(d) for d in history])
+    held = list(Portfolio.from_dict(raw).positions) if raw else []
+    paper_start = min([days[0]] + [date.fromisoformat(d) for d in store.get("equity_history") or {}])
     # Held tickers too, in case one was removed from the universe while still held.
-    tickers = list(dict.fromkeys(cfg.universe + [cfg.benchmark] + list(portfolio.positions)))
+    tickers = list(dict.fromkeys(cfg.universe + [cfg.benchmark] + held))
     start = min(days[0] - timedelta(days=WARMUP_DAYS), paper_start)
     adj: dict[str, float] = {}
     try:
@@ -293,16 +313,26 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
                              "I'll try again on the next run."), store)
         return []
     notes = _apply_adjustments(store, adj)
-    if notes:
-        portfolio = Portfolio.from_dict(store.get("portfolio"))
+
+    with store.transaction():  # one consistent snapshot of everything the run uses
+        rev = store.get("state_rev", 0)
+        same = (store.get("chosen_strategy") == name
+                and store.get("last_processed_day") == (last_raw and last.isoformat()))
+        raw = store.get("portfolio")
+        portfolio = Portfolio.from_dict(raw) if raw else Portfolio(cfg.capital)
+        history: dict[str, float] = dict(store.get("equity_history") or {})
+        state = DayState(
+            portfolio=portfolio,
+            pending=[Signal(**s) for s in store.get("pending_signals") or []],
+            paused=bool(store.get("paused", False)),
+            kill_switch=bool(store.get("kill_switch", False)),
+        )
+    if not same or not set(portfolio.positions) <= set(tickers):
+        # /choose changed the strategy or start day during the download: the next run redoes it.
+        store.log_event("state_changed_during_run", {"day": days[0].isoformat()})
+        return []
 
     # Compute every day in memory first (pure), so an error here changes nothing stored.
-    state = DayState(
-        portfolio=portfolio,
-        pending=[Signal(**s) for s in store.get("pending_signals") or []],
-        paused=bool(store.get("paused", False)),
-        kill_switch=bool(store.get("kill_switch", False)),
-    )
     strategy = REGISTRY[name]()
     done: list[_Day] = []
     bad: tuple[date, list[str]] | None = None
@@ -318,25 +348,28 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
         done.append(_Day(r, state.portfolio.to_dict(), [asdict(s) for s in state.pending],
                          state.kill_switch))
 
+    saved: list[_Day] = []
     for day in done:
-        if day.holiday is not None:  # nothing traded: only move past it
+        try:
             with store.transaction():
-                store.set("last_processed_day", day.holiday.isoformat())
-                store.log_event("unlisted_holiday", {"day": day.holiday.isoformat()})
-            continue
-        r = day.result
-        history[r.d.isoformat()] = r.equity
-        with store.transaction():
-            store.set("portfolio", day.portfolio)
-            store.set("pending_signals", day.pending)
-            store.set("kill_switch", day.kill_switch)
-            store.set("equity_history", history)
-            store.set("last_processed_day", r.d.isoformat())
-            store.log_event("paper_day", {
-                "day": r.d.isoformat(), "equity": r.equity, "buys": r.buys,
-                "sells": [x.ticker for x in r.sells], "stops": [x.ticker for x in r.stop_exits],
-                "skipped": [list(x) for x in r.skipped], "kill_tripped": r.kill_tripped_today})
-        committed.append(r.d)
+                if store.get("state_rev", 0) != rev:
+                    # Ruling R24: an owner command (/pause, /resume, /choose) landed after the
+                    # state was read. Roll this day back and stop quietly; the next run redoes it.
+                    raise _StateChanged
+                if day.holiday is not None:  # nothing traded: only move past it
+                    store.set("last_processed_day", day.holiday.isoformat())
+                    store.log_event("unlisted_holiday", {"day": day.holiday.isoformat()})
+                else:
+                    _save_day(store, day, history)
+        except _StateChanged:
+            store.log_event("state_changed_during_run",
+                            {"day": (day.holiday or day.result.d).isoformat()})
+            break
+        saved.append(day)
+        if day.result is not None:
+            committed.append(day.result.d)
+    stopped = len(saved) < len(done)
+    done = saved
 
     # Messages after the transactions (send writes the outbox itself). Each phase is guarded
     # separately so one failure doesn't suppress the others.
@@ -365,7 +398,7 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
     def summary() -> None:
         last_r = traded[-1].result
         sender(reports.daily_summary(
-            last_r.d, state.portfolio, last_r.equity, last_r.new_signals,
+            last_r.d, Portfolio.from_dict(traded[-1].portfolio), last_r.equity, last_r.new_signals,
             last_r.sells + last_r.stop_exits, [x.result.d for x in traded[:-1]], name,
             _below_benchmark(store, name), skipped=last_r.skipped, notes=notes), store)
 
@@ -380,7 +413,7 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
                 week_ends.append(prev[-1])
         week_ends.sort()
         if week_ends and store.get("last_weekly_week") != _week_key(week_ends[-1]):
-            metrics = _paper_metrics(state.portfolio, history, bars, cfg)
+            metrics = _paper_metrics(Portfolio.from_dict(traded[-1].portfolio), history, bars, cfg)
             text = reports.weekly_report(metrics, name, _oos(store, name))
             sender(text, store)
             store.set("last_weekly_report", text)  # for the /report command (Ruling R19)
@@ -393,7 +426,7 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
         phase("weekly report", weekly)
     elif notes:
         phase("holiday note", lambda: sender("\n".join(notes), store))
-    if bad is not None:
+    if bad is not None and not stopped:
         phase("bad-data alert", lambda: sender(_problems_text(*bad), store))
     if failed:
         if committed:

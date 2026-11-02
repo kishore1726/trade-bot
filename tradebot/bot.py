@@ -69,8 +69,15 @@ def _report(store: Store) -> str:
     return NO_REPORT
 
 
+def _bump_rev(store: Store) -> None:
+    """Ruling R24: every state-changing command bumps "state_rev" inside its own transaction,
+    so a daily run that read the state earlier discards its work instead of undoing this."""
+    store.set("state_rev", int(store.get("state_rev", 0)) + 1)
+
+
 def _pause(store: Store) -> str:
     with store.transaction():
+        _bump_rev(store)
         store.set("paused", True)
         store.log_event("pause", {})
     return "Paused. Stop-losses and sells still run; only new buys are paused. Send /resume to undo."
@@ -85,6 +92,7 @@ def _resume(cfg: Config, store: Store) -> str:
         hist = store.get("equity_history") or {}
         p.peak_equity = (float(hist[max(hist)]) if hist else
                          p.cash + sum(x.qty * x.entry_price for x in p.positions.values()))
+        _bump_rev(store)
         store.set("paused", False)
         store.set("kill_switch", False)
         store.set("portfolio", p.to_dict())
@@ -118,6 +126,7 @@ def _choose(arg: str, cfg: Config, store: Store, today: date) -> str:
             p.peak_equity = p.cash
             store.set("pending_signals", [])
             store.set("equity_history", {})
+        _bump_rev(store)
         store.set("portfolio", p.to_dict())
         store.set("chosen_strategy", arg)
         store.set("last_processed_day", previous_trading_day(today, cfg).isoformat())

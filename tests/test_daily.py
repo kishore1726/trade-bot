@@ -401,7 +401,7 @@ def test_failure_in_later_commit_returns_committed_days(cfg, store, scripted, mo
 
     def flaky():
         count["n"] += 1
-        if count["n"] == 2:
+        if count["n"] == 3:  # 1 = state snapshot after the download, 2 = TUE, 3 = WED
             raise RuntimeError("disk full")
         return real()
     monkeypatch.setattr(store, "transaction", flaky)
@@ -593,3 +593,91 @@ def test_adjustment_saved_even_when_day_cannot_be_processed(cfg, store, scripted
     fetch.adjust = {"A.NS": 0.5}
     assert run(TUE, cfg, store, fetch, Sender(), now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST)) == []
     assert store.get("portfolio")["positions"][0]["qty"] == 20
+
+
+# --- I1 / Ruling R24: owner commands during a run are never undone ------------------------
+
+class RacingFetch(FakeFetch):
+    """Runs a bot command (other connection = other process) while the download is running."""
+    def __init__(self, bars, command, cfg, other):
+        super().__init__(bars)
+        self.command, self.cfg, self.other, self.replies = command, cfg, other, []
+
+    def __call__(self, *a, **k):
+        from tradebot import bot
+        self.replies.append(bot.handle_command(self.command, 1, self.cfg, self.other, today=TUE))
+        return super().__call__(*a, **k)
+
+
+def test_resume_during_download_is_kept(cfg, store, scripted):
+    start_paper(store, MON)
+    p = Portfolio(17000.0)
+    p.peak_equity = 20000.0
+    store.set("portfolio", p.to_dict())
+    store.set("equity_history", {MON.isoformat(): 17000.0})
+    store.set("kill_switch", True)
+    other = Store(cfg.state_path)
+    try:
+        assert run(TUE, cfg, store, RacingFetch(flat_bars(), "/resume", cfg, other), Sender()) == [TUE]
+    finally:
+        other.close()
+    assert store.get("kill_switch") is False
+    assert store.get("portfolio")["peak_equity"] == 17000.0  # the /resume reset survived
+
+
+def _command_mid_compute(monkeypatch, cfg, other, command):
+    from tradebot import bot
+    real = daily.step_day
+    replies = []
+
+    def step(*a, **k):
+        if not replies:
+            replies.append(bot.handle_command(command, 1, cfg, other, today=TUE))
+        return real(*a, **k)
+    monkeypatch.setattr(daily, "step_day", step)
+    return replies
+
+
+def test_resume_between_read_and_save_is_preserved(cfg, store, scripted, monkeypatch):
+    start_paper(store, MON)
+    store.set("kill_switch", True)
+    other = Store(cfg.state_path)
+    try:
+        replies = _command_mid_compute(monkeypatch, cfg, other, "/resume")
+        s = Sender()
+        assert run(WED, cfg, store, FakeFetch(flat_bars()), s) == []
+    finally:
+        other.close()
+    assert replies and store.get("kill_switch") is False
+    assert store.get("last_processed_day") == MON.isoformat()  # rolled back: redone next run
+    assert store.events("state_changed_during_run")
+    assert s.messages == []  # quiet
+    monkeypatch.undo()
+    monkeypatch.setitem(REGISTRY, "scripted", Scripted)
+    assert run(WED, cfg, store, FakeFetch(flat_bars()), Sender()) == [TUE, WED]
+    assert store.get("kill_switch") is False
+
+
+def test_choose_between_read_and_save_is_preserved(cfg, store, scripted, monkeypatch):
+    monkeypatch.setitem(REGISTRY, "momentum", Momentum)
+    start_paper(store, date(2023, 12, 29))
+    store.set("backtest_summary", {"results": {"scripted": {}, "momentum": {}}})
+    other = Store(cfg.state_path)
+    try:
+        _command_mid_compute(monkeypatch, cfg, other, "/choose momentum")
+        assert run(WED, cfg, store, FakeFetch(flat_bars()), Sender()) == []
+    finally:
+        other.close()
+    assert store.get("chosen_strategy") == "momentum"
+    assert store.get("last_processed_day") == MON.isoformat()  # what /choose set
+    assert store.get("equity_history") == {}
+
+
+def test_commands_bump_state_rev(cfg, store):
+    from tradebot import bot
+    store.set("backtest_summary", {"results": {"scripted": {}}})
+    revs = []
+    for c in ("/status", "/pause", "/choose scripted", "/choose scripted", "/resume", "/help"):
+        bot.handle_command(c, 1, cfg, store, today=TUE)
+        revs.append(store.get("state_rev", 0))
+    assert revs == [0, 1, 2, 2, 3, 3]
