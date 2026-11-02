@@ -1,0 +1,85 @@
+# Verify cost values against Groww's current pricing page before trusting results.
+capital: 20000
+max_position_pct: 0.25
+max_positions: 4
+max_risk_pct: 0.02
+kill_switch_dd_pct: 0.15
+slippage_pct: 0.001
+benchmark: NIFTYBEES.NS
+data_dir: data
+state_path: state/tradebot.sqlite
+holidays_dir: holidays
+
+costs:
+  brokerage_pct: 0.001
+  brokerage_max: 20.0
+  brokerage_min: 5.0
+  stt_pct: 0.001
+  exchange_pct: 0.0000297
+  sebi_per_crore: 10.0
+  stamp_buy_pct: 0.00015
+  gst_pct: 0.18
+  dp_charge_per_sell: 20.0
+
+tax:
+  stcg_pct: 0.20
+  ltcg_pct: 0.125
+  ltcg_exempt_per_year: 125000
+
+# Nifty 50 constituents: this list MUST be checked against NSE's current index list (it changes
+# periodically; e.g. TMPV.NS is Tata Motors' passenger-vehicle entity after the 2025 demerger).
+universe:
+  - NIFTYBEES.NS
+  - BANKBEES.NS
+  - JUNIORBEES.NS
+  - GOLDBEES.NS
+  - ADANIENT.NS
+  - ADANIPORTS.NS
+  - APOLLOHOSP.NS
+  - ASIANPAINT.NS
+  - AXISBANK.NS
+  - BAJAJ-AUTO.NS
+  - BAJFINANCE.NS
+  - BAJAJFINSV.NS
+  - BEL.NS
+  - BHARTIARTL.NS
+  - CIPLA.NS
+  - COALINDIA.NS
+  - DRREDDY.NS
+  - EICHERMOT.NS
+  - ETERNAL.NS
+  - GRASIM.NS
+  - HCLTECH.NS
+  - HDFCBANK.NS
+  - HDFCLIFE.NS
+  - HINDALCO.NS
+  - HINDUNILVR.NS
+  - ICICIBANK.NS
+  - INDIGO.NS
+  - INFY.NS
+  - ITC.NS
+  - JIOFIN.NS
+  - JSWSTEEL.NS
+  - KOTAKBANK.NS
+  - LT.NS
+  - M&M.NS
+  - MARUTI.NS
+  - MAXHEALTH.NS
+  - NESTLEIND.NS
+  - NTPC.NS
+  - ONGC.NS
+  - POWERGRID.NS
+  - RELIANCE.NS
+  - SBILIFE.NS
+  - SBIN.NS
+  - SHRIRAMFIN.NS
+  - SUNPHARMA.NS
+  - TATACONSUM.NS
+  - TMPV.NS
+  - TATASTEEL.NS
+  - TCS.NS
+  - TECHM.NS
+  - TITAN.NS
+  - TRENT.NS
+  - ULTRACEMCO.NS
+  - WIPRO.NS
