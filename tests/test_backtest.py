@@ -89,17 +89,50 @@ def test_backtest_costs_reduce_equity(cfg):
 
 
 def test_backtest_kill_switch_blocks_new_buys(cfg):
-    cfg = replace(cfg, max_position_pct=1.0, max_risk_pct=1.0)
-    # A bought on D1 near full equity, then gaps down 30% (stop far below): drawdown > 15%.
-    a = mk([100, 100, 70, 70, 70, 70])
+    # A uses ~half the equity and gaps 100 -> 40 on D2 (stop far below): drawdown ~30%.
+    # B is signalled D2 (fill D3) and sold D3 (fill D4); with cash left, only the switch stops it.
+    cfg = replace(cfg, max_position_pct=0.5, max_risk_pct=1.0)
+    a = mk([100, 100, 40, 40, 40, 40])
     b = mk([50.0] * 6)
-    buy_b = [Signal("B.NS", "BUY", 40.0, "go")]
-    strat = Stub({D(0): [Signal("A.NS", "BUY", 1.0, "go")],
-                  D(2): buy_b, D(3): buy_b, D(4): buy_b})
-    m, equity, trades = run_backtest(strat, bars_with(a, b), D(0), D(5), cfg)
+    strat = {D(0): [Signal("A.NS", "BUY", 1.0, "go")],
+             D(2): [Signal("B.NS", "BUY", 30.0, "go")],
+             D(3): [Signal("B.NS", "SELL", None, "exit")]}
+    m, equity, trades = run_backtest(Stub(strat), bars_with(a, b), D(0), D(5), cfg)
     assert equity.iloc[2] < cfg.capital * 0.85
-    assert all(t.ticker != "B.NS" for t in trades)
-    assert m.trades == 0  # A still held, never sold
+    assert m.kill_switch_trips == 1
+    assert trades == []  # B never bought; A still held
+    # Control: with the switch effectively off, the same run does buy (and sell) B.
+    off = replace(cfg, kill_switch_dd_pct=0.99)
+    _, _, ctrl = run_backtest(Stub(strat), bars_with(a, b), D(0), D(5), off)
+    assert [(t.ticker, t.entry_date) for t in ctrl] == [("B.NS", D(3))]
+
+
+def test_buy_skipped_when_open_at_or_below_stop_even_if_slipped_entry_above(cfg):
+    # open 99.95 <= stop 100 < slipped entry 100.05: must be skipped, not bought and stopped out.
+    bars = bars_with(mk([100.0, 99.95], closes=[100.0, 101.0]))
+    s = _state(cfg)
+    s.pending = [Signal("A.NS", "BUY", 100.0, "go")]
+    r = step_day(s, D(1), bars, Stub({}), cfg)
+    assert r.skipped == [("A.NS", "gapped below stop")]
+    assert r.buys == [] and r.stop_exits == [] and s.portfolio.trades == []
+
+
+def test_open_position_at_end_taxed_and_costed_as_if_sold(cfg):
+    # R15: A bought D1 at 100 (no slippage), closes 120 at the end, still held.
+    cfg = replace(cfg, slippage_pct=0.0)
+    a = mk([100.0, 100.0, 110.0, 120.0], closes=[100.0, 100.0, 115.0, 120.0])
+    m, equity, trades = run_backtest(Stub({D(0): [Signal("A.NS", "BUY", 90.0, "go")]}),
+                                     bars_with(a), D(0), D(3), cfg)
+    assert trades == []
+    qty = 40  # risk cap 400 / (100 - 90) per share
+    buy_cost = trade_cost("BUY", qty * 100.0, cfg.costs)
+    sell_cost = trade_cost("SELL", qty * 120.0, cfg.costs)
+    gain = qty * 20.0 - buy_cost - sell_cost
+    assert m.total_return == pytest.approx((equity.iloc[-1] - 20000) / 20000)
+    assert equity.iloc[-1] == pytest.approx(20000 - buy_cost + qty * 20.0)  # mark-to-market
+    assert m.post_tax_return == pytest.approx(m.total_return - (sell_cost + 0.20 * gain) / 20000)
+    assert m.total_costs == pytest.approx(buy_cost + sell_cost)
+    assert m.trades == 0 and m.expectancy == 0.0
 
 
 def _state(cfg):

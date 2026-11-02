@@ -33,7 +33,8 @@ class Metrics:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Metrics":
-        return cls(**{f.name: d[f.name] for f in fields(cls)})
+        """Missing keys take the field default (e.g. summaries stored by older versions)."""
+        return cls(**{f.name: d[f.name] for f in fields(cls) if f.name in d})
 
 
 def _years(index: pd.Index) -> float:
@@ -84,9 +85,20 @@ def _benchmark(close: pd.Series, open_price: float | None, start: float, cfg: Co
 
 def compute_metrics(trades: list[Trade], equity: pd.Series, benchmark_close: pd.Series,
                     start_capital: float, cfg: Config,
-                    benchmark_open: float | None = None, kill_switch_trips: int = 0) -> Metrics:
+                    benchmark_open: float | None = None, kill_switch_trips: int = 0,
+                    open_at_end: list[Trade] | None = None,
+                    liquidated_equity: float | None = None) -> Metrics:
     """`benchmark_open` is the benchmark's open on the first day (the buy price);
-    when omitted the first benchmark close is used. `kill_switch_trips` is passed through."""
+    when omitted the first benchmark close is used. `kill_switch_trips` is passed through.
+
+    `open_at_end` (Ruling R15): hypothetical sales of positions still open on the last day
+    (at the last close, with sell slippage and charges). They are not counted as trades, but
+    post-tax return, the tax base (final year) and total_costs treat them as sold;
+    `liquidated_equity` is the cash after those sales. total_return and the equity curve
+    stay mark-to-market."""
+    if open_at_end and liquidated_equity is None:
+        raise ValueError("liquidated_equity is required with open_at_end")
+    open_at_end = open_at_end or []
     pnls = [t.pnl for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
@@ -98,10 +110,12 @@ def compute_metrics(trades: list[Trade], equity: pd.Series, benchmark_close: pd.
 
     # Strategy trades are short-term: STCG on each calendar year's net realised gain.
     by_year: dict[int, float] = defaultdict(float)
-    for t in trades:
+    for t in trades + open_at_end:
         by_year[t.exit_date.year] += t.pnl
     tax = sum(estimate_tax_stcg(g, cfg.tax) for g in by_year.values())
-    post_tax_return = (final - tax - start_capital) / start_capital
+    # Cash after selling everything still held (open_at_end); without them = final equity.
+    liquid = float(liquidated_equity) if open_at_end else final
+    post_tax_return = (liquid - tax - start_capital) / start_capital
 
     b_ret, b_cagr, b_post = _benchmark(benchmark_close, benchmark_open, start_capital, cfg)
 
@@ -116,7 +130,7 @@ def compute_metrics(trades: list[Trade], equity: pd.Series, benchmark_close: pd.
         cagr=float(cagr),
         benchmark_return=float(b_ret),
         benchmark_cagr=float(b_cagr),
-        total_costs=float(sum(t.costs for t in trades)),
+        total_costs=float(sum(t.costs for t in trades + open_at_end)),
         post_tax_return=float(post_tax_return),
         benchmark_post_tax_return=float(b_post),
         # Conservative: below if it trails the benchmark before OR after estimated tax.

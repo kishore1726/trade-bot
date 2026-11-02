@@ -127,3 +127,10 @@ def test_metrics_round_trip(cfg):
     assert Metrics.from_dict(asdict(replace(m, trades=7))).trades == 7
     m3 = replace(m, kill_switch_trips=3, expectancy_pct=-0.0123)
     assert Metrics.from_dict(json.loads(json.dumps(asdict(m3)))) == m3
+
+
+def test_from_dict_uses_defaults_for_missing_keys(cfg):
+    m = compute_metrics([], series([20000, 20000]), flat_bench(2), 20000, cfg)
+    d = asdict(m)
+    del d["kill_switch_trips"], d["expectancy_pct"]  # summary stored before these existed
+    assert Metrics.from_dict(d) == m

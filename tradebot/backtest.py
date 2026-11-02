@@ -5,6 +5,7 @@ up to d (equity); strategies see rows <= d and their signals fill at the NEXT da
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import date
 from typing import Literal
@@ -97,10 +98,10 @@ def step_day(state: DayState, d: date, bars: Bars, strategy: Strategy, cfg: Conf
             skipped.append((s.ticker, "no stop given"))
             continue
         open_price = float(row["open"])
-        entry = open_price * (1 + cfg.slippage_pct)
-        if entry <= s.stop:
+        if open_price <= s.stop:  # would be stopped out at the open straight away
             skipped.append((s.ticker, "gapped below stop"))
             continue
+        entry = open_price * (1 + cfg.slippage_pct)
         sizing_equity = p.cash + sum(pos.qty * _price_at_open(bars, t, ts)
                                      for t, pos in p.positions.items())
         qty, reason = size_position(sizing_equity, p.cash, entry, s.stop, len(p.positions), cfg)
@@ -161,9 +162,18 @@ def run_backtest(strategy: Strategy, bars: Bars, start: date, end: date,
     bench = bars[cfg.benchmark]
     bench = bench[(bench.index >= pd.Timestamp(days[0])) & (bench.index <= pd.Timestamp(days[-1]))]
     trades = list(state.portfolio.trades)
+    # R15: value what is still held as if sold at the last close (same code path as a real sale).
+    liquid = copy.deepcopy(state.portfolio)
+    last_ts = pd.Timestamp(days[-1])
+    open_at_end = []
+    for t in list(liquid.positions):
+        closes = bars[t]["close"]
+        open_at_end.append(liquid.sell(t, float(closes[closes.index <= last_ts].iloc[-1]),
+                                       days[-1], "end of backtest", cfg))
     bench_open = float(bench["open"].iloc[0]) if not bench.empty else None
     metrics = compute_metrics(trades, equity, bench["close"], cfg.capital, cfg,
-                              benchmark_open=bench_open, kill_switch_trips=trips)
+                              benchmark_open=bench_open, kill_switch_trips=trips,
+                              open_at_end=open_at_end, liquidated_equity=liquid.cash)
     return metrics, equity, trades
 
 
@@ -177,6 +187,7 @@ def _years_before(d: date, years: int) -> date:
 def walk_forward(strategy_names: list[str], bars: Bars, cfg: Config,
                  holdout_years: int = 2) -> dict[str, dict[Segment, Metrics]]:
     """Out-of-sample = the last `holdout_years` years of data; in-sample = everything before.
+    (Ruling R14: a rolling window back from the last bar date, not whole calendar years.)
 
     Each segment starts with fresh capital; strategies still see all earlier bars (warm-up).
     """
