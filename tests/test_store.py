@@ -65,7 +65,9 @@ def test_transaction_rollback_on_error(tmp_path):
     assert s.events() == []
     # store still usable afterwards
     s.set("c", 4)
-    assert Store(p).get("c") == 4
+    c = Store(p)
+    assert c.get("c") == 4
+    c.close()
     s.close()
 
 

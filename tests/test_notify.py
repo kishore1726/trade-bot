@@ -1,7 +1,15 @@
 import httpx
+import pytest
 
 from tradebot import notify
 from tradebot.store import Store
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = Store(tmp_path / "s.db")
+    yield s
+    s.close()
 
 
 def _env(monkeypatch):
@@ -13,9 +21,8 @@ def _client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
-def test_send_queues_on_network_error(tmp_path, monkeypatch):
+def test_send_queues_on_network_error(store, monkeypatch):
     _env(monkeypatch)
-    store = Store(tmp_path / "s.db")
 
     def boom(request):
         raise httpx.ConnectError("no network")
@@ -26,9 +33,8 @@ def test_send_queues_on_network_error(tmp_path, monkeypatch):
     assert len(err) == 1 and "Traceback" not in str(err[0]["payload"])
 
 
-def test_send_flushes_backlog_in_order(tmp_path, monkeypatch):
+def test_send_flushes_backlog_in_order(store, monkeypatch):
     _env(monkeypatch)
-    store = Store(tmp_path / "s.db")
     store.outbox_add("first")
     seen = []
 
@@ -43,9 +49,8 @@ def test_send_flushes_backlog_in_order(tmp_path, monkeypatch):
     assert "chat_id=42" in seen[0][1] or '"chat_id": "42"' in seen[0][1] or "42" in seen[0][1]
 
 
-def test_flush_stops_at_first_failure(tmp_path, monkeypatch):
+def test_flush_stops_at_first_failure(store, monkeypatch):
     _env(monkeypatch)
-    store = Store(tmp_path / "s.db")
     calls = []
 
     def bad(request):
@@ -58,18 +63,16 @@ def test_flush_stops_at_first_failure(tmp_path, monkeypatch):
     assert len(calls) == 2  # one attempt per send, not per queued message
 
 
-def test_not_configured_queues_and_logs(tmp_path, monkeypatch):
+def test_not_configured_queues_and_logs(store, monkeypatch):
     monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
-    store = Store(tmp_path / "s.db")
     assert notify.send("hi", store, _client(lambda r: httpx.Response(200))) is False
     assert len(store.outbox_pending()) == 1
     assert len(store.events("telegram_not_configured")) == 1
 
 
-def test_long_message_split(tmp_path, monkeypatch):
+def test_long_message_split(store, monkeypatch):
     _env(monkeypatch)
-    store = Store(tmp_path / "s.db")
     text = "\n".join(["x" * 100] * 100)
     sent = []
 
