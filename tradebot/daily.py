@@ -24,7 +24,8 @@ import pandas as pd
 
 from tradebot import reports
 from tradebot.backtest import DayResult, DayState, step_day
-from tradebot.calendar import is_trading_day, previous_trading_day, trading_days_between
+from tradebot.calendar import (HolidayFileError, is_trading_day, previous_trading_day,
+                               trading_days_between)
 from tradebot.config import Config
 from tradebot.data import Bars, fetch_bars, validate_day
 from tradebot.metrics import Metrics, compute_metrics
@@ -104,10 +105,11 @@ def _below_benchmark(store: Store, name: str) -> bool:
 
 @dataclass
 class _Day:
-    result: DayResult
-    portfolio: dict
-    pending: list[dict]
-    kill_switch: bool
+    result: DayResult | None  # None for an unlisted market holiday (Ruling R22)
+    portfolio: dict | None = None
+    pending: list[dict] | None = None
+    kill_switch: bool = False
+    holiday: date | None = None
 
 
 def _paper_metrics(portfolio: Portfolio, history: dict[str, float], bars: Bars,
@@ -150,6 +152,13 @@ def run_daily(today: date, cfg: Config, store: Store, fetch=fetch_bars, sender=s
     sender = _dedup(sender, store, now)
     try:
         return _run(today, cfg, store, fetch, sender, now, committed)
+    except HolidayFileError as exc:  # the owner can fix this: say exactly where
+        _log_exception(cfg, "holiday file problem")
+        try:
+            sender(reports.alert(f"{exc} Nothing was traded until it is fixed."), store)
+        except Exception:
+            _log_exception(cfg, "sending the holiday-file alert failed")
+        return list(committed)
     except Exception:
         _log_exception(cfg, "daily run failed")
         try:
@@ -174,7 +183,33 @@ def _remind_once(store: Store, today: date, sender, text: str) -> None:
         sender(reports.alert(text), store)
 
 
+def _holiday_file_check(today: date, cfg: Config, store: Store, sender) -> None:
+    """Ruling R22: from 1 December, ask for next year's holiday list (once a day, R21)."""
+    if today.month != 12:
+        return
+    nxt = today.year + 1
+    if not (cfg.holidays_dir / f"nse_{nxt}.txt").exists():
+        sender(reports.alert(
+            f"The NSE holiday list for {nxt} is missing. Please add the file "
+            f"holidays/nse_{nxt}.txt (one date per line, written as YYYY-MM-DD) copied from NSE's "
+            "official holiday list. Without it I may wait or skip on market holidays."), store)
+
+
+def _holiday_note(d: date) -> str:
+    return f"Market was closed on {d.isoformat()} (holiday not in my list)."
+
+
+def _unlisted_holiday(d: date, tickers: list[str], bars: Bars, cfg: Config) -> bool:
+    """Ruling R22: no ticker has a bar on d, but the benchmark has a bar on a later day."""
+    ts = pd.Timestamp(d)
+    if any(x in bars and ts in bars[x].index for x in tickers):
+        return False
+    bench = bars.get(cfg.benchmark)
+    return bench is not None and bool((bench.index > ts).any())
+
+
 def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[date]:
+    _holiday_file_check(today, cfg, store, sender)
     name = store.get("chosen_strategy")
     if not name:
         _remind_once(store, today, sender, "Paper trading has not started: no strategy chosen yet. "
@@ -220,6 +255,9 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
     done: list[_Day] = []
     bad: tuple[date, list[str]] | None = None
     for d in days:
+        if _unlisted_holiday(d, tickers, bars, cfg):
+            done.append(_Day(None, holiday=d))
+            continue
         problems = [f"{x}: no data" for x in tickers if x not in bars] + validate_day(bars, d)
         if problems:
             bad = (d, problems)
@@ -229,6 +267,11 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
                          state.kill_switch))
 
     for day in done:
+        if day.holiday is not None:  # nothing traded: only move past it
+            with store.transaction():
+                store.set("last_processed_day", day.holiday.isoformat())
+                store.log_event("unlisted_holiday", {"day": day.holiday.isoformat()})
+            continue
         r = day.result
         history[r.d.isoformat()] = r.equity
         with store.transaction():
@@ -255,8 +298,11 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
             failed = True
             _log_exception(cfg, f"{what} failed")
 
+    traded = [x for x in done if x.result is not None]
+    notes = [_holiday_note(x.holiday) for x in done if x.holiday is not None]
+
     def kill_alerts() -> None:
-        for day in done:
+        for day in traded:
             if day.result.kill_tripped_today:
                 sender(reports.alert(
                     f"Safety switch tripped on {day.result.d.isoformat()}: the paper account fell "
@@ -265,14 +311,22 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
                     "Send /resume when you're ready."), store)
 
     def summary() -> None:
-        last_r = done[-1].result
+        last_r = traded[-1].result
         sender(reports.daily_summary(
             last_r.d, state.portfolio, last_r.equity, last_r.new_signals,
-            last_r.sells + last_r.stop_exits, [x.result.d for x in done[:-1]], name,
-            _below_benchmark(store, name), skipped=last_r.skipped), store)
+            last_r.sells + last_r.stop_exits, [x.result.d for x in traded[:-1]], name,
+            _below_benchmark(store, name), skipped=last_r.skipped, notes=notes), store)
 
     def weekly() -> None:
-        week_ends = [x.result.d for x in done if _last_day_of_week(x.result.d, cfg)]
+        week_ends = [x.result.d for x in traded if _last_day_of_week(x.result.d, cfg)]
+        # A week whose last calendar trading day was an unlisted holiday ends on the trading
+        # day before the first processed day of the next week.
+        seen = sorted(date.fromisoformat(k) for k in history)
+        for x in traded:
+            prev = [h for h in seen if h < x.result.d]
+            if prev and _week_key(prev[-1]) != _week_key(x.result.d):
+                week_ends.append(prev[-1])
+        week_ends.sort()
         if week_ends and store.get("last_weekly_week") != _week_key(week_ends[-1]):
             metrics = _paper_metrics(state.portfolio, history, bars, cfg)
             text = reports.weekly_report(metrics, name, _oos(store, name))
@@ -281,10 +335,12 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
             # Only after send() was called (a False return is fine: it's queued in the outbox).
             store.set("last_weekly_week", _week_key(week_ends[-1]))
 
-    if done:
+    if traded:
         phase("kill-switch alert", kill_alerts)
         phase("daily summary", summary)
         phase("weekly report", weekly)
+    elif notes:
+        phase("holiday note", lambda: sender("\n".join(notes), store))
     if bad is not None:
         phase("bad-data alert", lambda: sender(_problems_text(*bad), store))
     if failed:

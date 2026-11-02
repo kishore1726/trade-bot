@@ -29,13 +29,15 @@ def alert(text: str) -> str:
 
 def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Signal],
                   exits: list[Trade], caught_up_days: list[date], strategy_name: str,
-                  below_benchmark: bool, skipped: list[tuple[str, str]] = ()) -> str:
+                  below_benchmark: bool, skipped: list[tuple[str, str]] = (),
+                  notes: list[str] = ()) -> str:
     lines = [f"Daily summary {d.isoformat()} - strategy: {strategy_name}"]
     if below_benchmark:
         lines.append(f"{BELOW}: this strategy has been lagging a simple Nifty buy-and-hold.")
     if caught_up_days:
         n = len(caught_up_days)
         lines.append(f"Caught up {n} missed day(s): " + ", ".join(x.isoformat() for x in caught_up_days))
+    lines += list(notes)
     lines += ["", f"Cash: {money(portfolio.cash)}", f"Total value: {money(equity)}",
               f"Open positions: {len(portfolio.positions)}"]
     for p in portfolio.positions.values():

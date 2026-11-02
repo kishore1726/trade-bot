@@ -57,7 +57,7 @@ class FakeFetch:
     def __init__(self, bars, error=None):
         self.bars, self.error, self.calls = bars, error, []
 
-    def __call__(self, tickers, start, end, cfg, now=None):
+    def __call__(self, tickers, start, end, cfg, now=None, adjustments=None):
         self.calls.append((list(tickers), start, end))
         self.now = now
         if self.error:
@@ -472,3 +472,68 @@ def test_alerts_deduplicated_per_ist_day(cfg, store, scripted):
     run(FRI, cfg, store, fetch, sender)
     assert len(sender.messages) == 2
     assert list(store.get("last_alerts")) == [FRI.isoformat()]
+
+
+# --- C1 / Ruling R22: unlisted market holidays -------------------------------------------
+
+def _closed_on(bars, d):
+    return {t: df.drop(pd.Timestamp(d)) for t, df in bars.items()}
+
+
+def test_unlisted_holiday_is_skipped_and_mentioned(cfg, store, scripted):
+    bars = _closed_on(flat_bars(), WED)
+    start_paper(store, MON)
+    scripted.buy_on = {TUE}  # filled at the next real trading day's open (THU)
+    s = Sender()
+    assert run(THU, cfg, store, FakeFetch(bars), s) == [TUE, THU]
+    assert store.get("last_processed_day") == THU.isoformat()
+    assert WED.isoformat() not in store.get("equity_history")
+    assert [e["payload"]["day"] for e in store.events("unlisted_holiday")] == [WED.isoformat()]
+    assert store.get("portfolio")["positions"][0]["entry_date"] == THU.isoformat()
+    assert f"Market was closed on {WED.isoformat()} (holiday not in my list)" in s.messages[-1]
+    assert not any(m.startswith("⚠️") for m in s.messages)
+
+
+def test_unlisted_holiday_does_not_halt_forever(cfg, store, scripted):
+    """Reviewer probe: before the fix last_processed_day stayed on TUE for ever."""
+    bars = _closed_on(flat_bars(), WED)
+    start_paper(store, MON)
+    s = Sender()
+    assert run(WED, cfg, store, FakeFetch(bars), s) == [TUE]  # no later bar yet: wait
+    assert store.get("last_processed_day") == TUE.isoformat()
+    for today in (THU, FRI, date(2024, 1, 8), date(2024, 1, 9)):
+        run(today, cfg, store, FakeFetch(bars), s)
+    assert store.get("last_processed_day") == "2024-01-09"
+
+
+def test_december_alert_for_missing_next_year_holiday_file(cfg, store):
+    s = Sender()
+    run(date(2024, 11, 29), cfg, store, FakeFetch({}), s)
+    assert not any("nse_2025.txt" in m for m in s.messages)
+    run(date(2024, 12, 2), cfg, store, FakeFetch({}), s)
+    run(date(2024, 12, 2), cfg, store, FakeFetch({}), s)
+    alerts = [m for m in s.messages if "nse_2025.txt" in m]
+    assert len(alerts) == 1 and alerts[0].startswith("⚠️") and "holidays" in alerts[0]
+    (cfg.holidays_dir / "nse_2025.txt").write_text("2025-01-26\n")
+    run(date(2024, 12, 3), cfg, store, FakeFetch({}), s)
+    assert len([m for m in s.messages if "nse_2025.txt" in m]) == 1
+
+
+def test_bad_holiday_file_alert_names_file_and_line(cfg, store, scripted):
+    (cfg.holidays_dir / "nse_2024.txt").write_text("# list\n2024-01-26\n2024-1-3x\n")
+    start_paper(store, MON)
+    s = Sender()
+    assert run(TUE, cfg, store, FakeFetch(flat_bars()), s) == []
+    (msg,) = s.messages
+    assert "nse_2024.txt" in msg and "line 3" in msg and "Something went wrong" not in msg
+
+
+def test_weekly_report_sent_when_friday_was_unlisted_holiday(cfg, store, scripted):
+    bars = _closed_on(flat_bars(), FRI)
+    start_paper(store, MON)
+    s = Sender()
+    run(THU, cfg, store, FakeFetch(bars), s)
+    assert not any(m.startswith("Weekly report") for m in s.messages)
+    run(date(2024, 1, 8), cfg, store, FakeFetch(bars), s)
+    assert len([m for m in s.messages if m.startswith("Weekly report")]) == 1
+    assert store.get("last_weekly_week") == "2024-W01"
