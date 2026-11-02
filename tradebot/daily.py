@@ -258,7 +258,9 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
         week_ends = [x.result.d for x in done if _last_day_of_week(x.result.d, cfg)]
         if week_ends and store.get("last_weekly_week") != _week_key(week_ends[-1]):
             metrics = _paper_metrics(state.portfolio, history, bars, cfg)
-            sender(reports.weekly_report(metrics, name, _oos(store, name)), store)
+            text = reports.weekly_report(metrics, name, _oos(store, name))
+            sender(text, store)
+            store.set("last_weekly_report", text)  # for the /report command (Ruling R19)
             # Only after send() was called (a False return is fine: it's queued in the outbox).
             store.set("last_weekly_week", _week_key(week_ends[-1]))
 

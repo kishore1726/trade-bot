@@ -449,3 +449,13 @@ def test_real_strategy_catch_up_same_as_day_by_day(cfg, tmp_path, name):
     finally:
         s1.close()
         s2.close()
+
+
+def test_weekly_report_text_is_stored_for_report_command(cfg, store, scripted):
+    start_paper(store, MON)
+    fetch, sender = FakeFetch(flat_bars()), Sender()
+    run(THU, cfg, store, fetch, sender)
+    assert store.get("last_weekly_report") is None
+    run(FRI, cfg, store, fetch, sender)
+    weekly = [m for m in sender.messages if "Weekly report" in m]
+    assert store.get("last_weekly_report") == weekly[0]
