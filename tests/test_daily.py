@@ -772,3 +772,45 @@ def test_catch_up_summary_lists_earlier_exits_and_skips(cfg, store, scripted):
     assert "Closed today" not in summary
     assert f"{TUE.isoformat()} A.NS: " in summary and "stop-loss hit" in summary
     assert f"{WED.isoformat()} A.NS: gapped below stop" in summary
+
+
+
+# --- I7: BUY estimates, will-be-skipped marks, change in value --------------------------
+
+def test_summary_estimates_buys_with_sizing_rules(cfg, store, scripted):
+    from tradebot.risk import size_position
+    start_paper(store, MON)
+    store.set("equity_history", {MON.isoformat(): 19000.0})
+    scripted.buy_on = {TUE}
+    s = Sender()
+    run(TUE, cfg, store, FakeFetch(flat_bars()), s, now=lambda: datetime(2024, 1, 2, 21, tzinfo=IST))
+    entry = 100.0 * (1 + cfg.slippage_pct)
+    qty, _ = size_position(20000.0, 20000.0, entry, 90.0, 0, cfg)
+    summary = s.messages[-1]
+    assert f"about {qty} shares, ₹{qty * entry:,.0f} at today's close" in summary
+    assert "Change since the previous day: +₹1,000" in summary
+
+
+@pytest.mark.parametrize("flag,why", [("paused", "paused"), ("kill_switch", "safety switch")])
+def test_summary_marks_buys_that_will_be_skipped(cfg, store, scripted, flag, why):
+    start_paper(store, MON)
+    store.set(flag, True)
+    scripted.buy_on = {TUE}
+    s = Sender()
+    run(TUE, cfg, store, FakeFetch(flat_bars()), s, now=lambda: datetime(2024, 1, 2, 21, tzinfo=IST))
+    line = [x for x in s.messages[-1].splitlines() if "BUY A.NS" in x][0]
+    assert "will be skipped" in line and why in line
+
+
+def test_summary_marks_buy_without_free_slot(cfg, store, scripted):
+    from dataclasses import replace
+    cfg = replace(cfg, max_positions=1)
+    start_paper(store, MON)
+    p = Portfolio(cfg.capital)
+    p.buy("B.NS", 10, 100.0, MON, 90.0, "scripted", cfg)
+    store.set("portfolio", p.to_dict())
+    scripted.buy_on = {TUE}
+    s = Sender()
+    run(TUE, cfg, store, FakeFetch(flat_bars()), s, now=lambda: datetime(2024, 1, 2, 21, tzinfo=IST))
+    line = [x for x in s.messages[-1].splitlines() if "BUY A.NS" in x][0]
+    assert "will be skipped: no free slot" in line

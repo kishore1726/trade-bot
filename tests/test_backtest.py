@@ -293,3 +293,13 @@ def test_step_day_never_auto_resumes(cfg):
     results = [step_day(s, day, bars, strat, cfg) for day in d]
     assert [i for i, r in enumerate(results) if r.kill_tripped_today] == [2]
     assert all(not r.buys for r in results[2:]) and s.kill_switch
+
+
+def test_segment_dates_match_walk_forward_split():
+    from tradebot.backtest import segment_dates
+    days = pd.bdate_range("2020-01-01", "2023-12-29")
+    flat = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+                         "volume": 1000.0}, index=days)
+    seg = segment_dates({"A.NS": flat}, holdout_years=2)
+    assert seg["in_sample"] == (date(2020, 1, 1), date(2021, 12, 29))
+    assert seg["out_of_sample"] == (date(2021, 12, 30), date(2023, 12, 29))

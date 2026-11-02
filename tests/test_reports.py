@@ -82,3 +82,33 @@ def test_weekly_zero_trades_and_comparison_caveat():
     assert "can mislead" in reports.backtest_comparison(res, ["trend"])
     w = reports.weekly_report(_m(), "trend", _m(win_rate=0.5))
     assert "paper 40.0% / backtest 50.0%" in w
+
+
+
+def test_backtest_comparison_has_expectancy_costs_annualised_and_period():
+    """I6: spec section 8 metrics in the comparison, plus the out-of-sample dates."""
+    m = _m(expectancy=120.0, expectancy_pct=0.0123, total_costs=1234.0, cagr=0.105,
+           benchmark_cagr=0.081)
+    res = {"trend": {"in_sample": _m(), "out_of_sample": m}}
+    seg = {"in_sample": {"start": "2016-01-01", "end": "2024-11-01"},
+           "out_of_sample": {"start": "2024-11-04", "end": "2026-11-02"}}
+    txt = reports.backtest_comparison(res, ["trend"], seg)
+    for s in ["₹120", "1.2%", "₹1,234", "10.5%", "8.1%", "2024-11-04 to 2026-11-02"]:
+        assert s in txt, s
+    assert "2024-11-04" not in reports.backtest_comparison(res, ["trend"])  # old summaries
+
+
+def test_daily_summary_buy_estimates_and_change():
+    """I7: estimated shares and amount per BUY, orders that will be skipped, change in value."""
+    sigs = [Signal("TCS.NS", "BUY", 3200.0, "breakout"), Signal("ITC.NS", "BUY", 400.0, "breakout"),
+            Signal("LT.NS", "BUY", 3000.0, "breakout")]
+    est = {"TCS.NS": (2, 6800.0), "ITC.NS": ("will", "no free slot (already holding 4 positions)"),
+           "LT.NS": ("may", "not enough room or cash")}
+    txt = reports.daily_summary(date(2026, 11, 2), _pf(), 20000.0, sigs, [], [], "trend", False,
+                                estimates=est, previous_equity=19000.0)
+    assert "BUY TCS.NS" in txt and "about 2 shares, ₹6,800 at today's close" in txt
+    assert "ITC.NS" in txt and "will be skipped: no free slot (already holding 4 positions)" in txt
+    assert "may be skipped: not enough room or cash" in txt
+    assert "Change since the previous day: +₹1,000 (+5.3%)" in txt
+    first = reports.daily_summary(date(2026, 11, 2), _pf(), 20000.0, [], [], [], "trend", False)
+    assert "Change since" not in first

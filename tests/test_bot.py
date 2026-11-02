@@ -91,6 +91,7 @@ def test_pause_resume_flags(cfg, store):
 
 
 def test_resume_resets_peak(cfg, store):
+    store.set("kill_switch", True)
     p = held(cfg, store)
     p.peak_equity = 99999.0
     store.set("portfolio", p.to_dict())
@@ -100,6 +101,7 @@ def test_resume_resets_peak(cfg, store):
 
 
 def test_resume_peak_fallback_without_history(cfg, store):
+    store.set("kill_switch", True)
     p = held(cfg, store)
     p.peak_equity = 99999.0
     store.set("portfolio", p.to_dict())
@@ -306,3 +308,36 @@ def test_choose_records_paper_start_capital(cfg, store):
     store.set("portfolio", p.to_dict())
     cmd("/choose other", cfg, store)
     assert store.get("paper_start_capital") == 15000
+
+
+
+def test_resume_keeps_peak_when_only_paused(cfg, store):
+    """I8: the peak is reset only when the safety switch was on."""
+    p = held(cfg, store)
+    p.peak_equity = 99999.0
+    store.set("portfolio", p.to_dict())
+    store.set("chosen_strategy", "momentum")
+    store.set("equity_history", {"2024-01-02": 18000.0})
+    store.set("paused", True)
+    out = cmd("/resume", cfg, store)
+    assert Portfolio.from_dict(store.get("portfolio")).peak_equity == 99999.0
+    assert "pause" in out and "safety switch" not in out
+    store.set("kill_switch", True)
+    out = cmd("/resume", cfg, store)
+    assert Portfolio.from_dict(store.get("portfolio")).peak_equity == 18000.0
+    assert "safety switch" in out and "18,000" in out
+
+
+def test_resume_when_nothing_to_clear(cfg, store):
+    store.set("chosen_strategy", "momentum")
+    store.set("portfolio", Portfolio(1000).to_dict())
+    out = cmd("/resume", cfg, store)
+    assert "nothing" in out.lower() and store.get("state_rev", 0) == 0
+
+
+def test_report_shows_out_of_sample_period(cfg, store):
+    s = summary("momentum")
+    s["segments"] = {"in_sample": {"start": "2016-01-01", "end": "2024-11-01"},
+                     "out_of_sample": {"start": "2024-11-04", "end": "2026-11-02"}}
+    store.set("backtest_summary", s)
+    assert "2024-11-04 to 2026-11-02" in cmd("/report", cfg, store)

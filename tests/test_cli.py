@@ -163,3 +163,31 @@ def test_startup_alert_never_raises(broken_config, monkeypatch):
         raise OSError("offline")
     monkeypatch.setattr(cli, "_post", boom, raising=False)
     assert cli.main(["run-daily"]) == 1
+
+
+
+def test_backtest_stores_segment_dates(monkeypatch, tmp_path):
+    """I6: the out-of-sample date range is kept with the results (new optional R4 key)."""
+    import pandas as pd
+    from datetime import date
+    from types import SimpleNamespace
+    from tradebot.store import Store
+    from tradebot.metrics import Metrics
+    days = pd.bdate_range("2020-01-01", "2023-12-29")
+    flat = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}, index=days)
+    monkeypatch.setattr(cli, "fetch_bars", lambda *a, **k: {"A.NS": flat})
+    m = Metrics(trades=0, win_rate=0, avg_win=0, avg_loss=0, expectancy=0, max_drawdown=0,
+                total_return=0, cagr=0, benchmark_return=0, benchmark_cagr=0, total_costs=0,
+                post_tax_return=0, benchmark_post_tax_return=0, below_benchmark=False)
+    monkeypatch.setattr(cli, "walk_forward", lambda names, bars, cfg: {"x": {"in_sample": m, "out_of_sample": m}})
+    monkeypatch.setattr(cli, "rank", lambda res, cfg: ["x"])
+    monkeypatch.setattr(cli, "send", lambda text, store: True)
+    store = Store(tmp_path / "s.db")
+    try:
+        assert cli.cmd_backtest(SimpleNamespace(universe=["A.NS"], benchmark="A.NS"), store,
+                                date(2020, 1, 1)) == 0
+        seg = store.get("backtest_summary")["segments"]
+    finally:
+        store.close()
+    assert seg == {"in_sample": {"start": "2020-01-01", "end": "2021-12-29"},
+                   "out_of_sample": {"start": "2021-12-30", "end": "2023-12-29"}}

@@ -184,28 +184,32 @@ def _years_before(d: date, years: int) -> date:
         return d.replace(year=d.year - years, day=28)
 
 
-def walk_forward(strategy_names: list[str], bars: Bars, cfg: Config,
-                 holdout_years: int = 2) -> dict[str, dict[Segment, Metrics]]:
-    """Out-of-sample = the last `holdout_years` years of data; in-sample = everything before.
-    (Ruling R14: a rolling window back from the last bar date, not whole calendar years.)
+def segment_dates(bars: Bars, holdout_years: int = 2) -> dict[Segment, tuple[date, date]]:
+    """First and last trading day of each walk-forward segment.
 
-    Each segment starts with fresh capital; strategies still see all earlier bars (warm-up).
-    """
+    Out-of-sample = the last `holdout_years` years of data; in-sample = everything before.
+    (Ruling R14: a rolling window back from the last bar date, not whole calendar years.)"""
     all_days = _trading_days(bars, date.min, date.max)
     if not all_days:
         raise ValueError("no market data")
-    first, last = all_days[0], all_days[-1]
-    split = _years_before(last, holdout_years)  # in-sample ends on/before this date
+    split = _years_before(all_days[-1], holdout_years)  # in-sample ends on/before this date
     in_days = [d for d in all_days if d <= split]
     oos_days = [d for d in all_days if d > split]
     if not in_days or not oos_days:
         raise ValueError(f"need more than {holdout_years} years of data for walk-forward")
+    return {"in_sample": (in_days[0], in_days[-1]), "out_of_sample": (oos_days[0], oos_days[-1])}
+
+
+def walk_forward(strategy_names: list[str], bars: Bars, cfg: Config,
+                 holdout_years: int = 2) -> dict[str, dict[Segment, Metrics]]:
+    """Run every strategy on both segments of segment_dates().
+
+    Each segment starts with fresh capital; strategies still see all earlier bars (warm-up).
+    """
+    seg = segment_dates(bars, holdout_years)
     out: dict[str, dict[Segment, Metrics]] = {}
     for name in strategy_names:
-        out[name] = {
-            "in_sample": run_backtest(REGISTRY[name](), bars, first, in_days[-1], cfg)[0],
-            "out_of_sample": run_backtest(REGISTRY[name](), bars, oos_days[0], last, cfg)[0],
-        }
+        out[name] = {s: run_backtest(REGISTRY[name](), bars, a, b, cfg)[0] for s, (a, b) in seg.items()}
     return out
 
 

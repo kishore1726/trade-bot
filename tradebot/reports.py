@@ -30,9 +30,13 @@ def alert(text: str) -> str:
 def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Signal],
                   exits: list[Trade], caught_up_days: list[date], strategy_name: str,
                   below_benchmark: bool, skipped: list[tuple[date, str, str]] = (),
-                  notes: list[str] = ()) -> str:
+                  notes: list[str] = (),
+                  estimates: dict[str, tuple] | None = None,
+                  previous_equity: float | None = None) -> str:
     """`exits` and `skipped` cover every day processed in this run; after a catch-up each line
-    carries its date."""
+    carries its date. `estimates` (I7): per BUY ticker either (shares, rupees) estimated at
+    today's close, or ("will" | "may", reason) when the order will (or may) be skipped.
+    `previous_equity`: total value on the previous trading day."""
     dated = bool(caught_up_days)
     lines = [f"Daily summary {d.isoformat()} - strategy: {strategy_name}"]
     if below_benchmark:
@@ -41,8 +45,12 @@ def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Si
         n = len(caught_up_days)
         lines.append(f"Caught up {n} missed day(s): " + ", ".join(x.isoformat() for x in caught_up_days))
     lines += list(notes)
-    lines += ["", f"Cash: {money(portfolio.cash)}", f"Total value: {money(equity)}",
-              f"Open positions: {len(portfolio.positions)}"]
+    lines += ["", f"Cash: {money(portfolio.cash)}", f"Total value: {money(equity)}"]
+    if previous_equity:
+        ch = equity - previous_equity
+        lines.append(f"Change since the previous day: {'+' if round(ch) >= 0 else ''}{money(ch)} "
+                     f"({ch / previous_equity * 100:+.1f}%)")
+    lines.append(f"Open positions: {len(portfolio.positions)}")
     for p in portfolio.positions.values():
         lines.append(f"  {p.ticker}: {p.qty} shares, bought at {money(p.entry_price)}, stop {money(p.stop)}")
     if exits:
@@ -57,6 +65,11 @@ def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Si
         for s in signals:
             if s.action == "BUY":
                 stop = f", stop {money(s.stop)}" if s.stop is not None else ""
+                est = (estimates or {}).get(s.ticker)
+                if est and isinstance(est[0], str):
+                    stop += f" ({est[0]} be skipped: {est[1]})"
+                elif est:
+                    stop += f", about {est[0]} shares, {money(est[1])} at today's close"
                 lines.append(f"  BUY {s.ticker}{stop} - {s.reason}")
             else:
                 lines.append(f"  SELL {s.ticker} - {s.reason}")
@@ -97,8 +110,13 @@ def weekly_report(metrics: Metrics, strategy_name: str, backtest_oos: Metrics | 
     return "\n".join(lines)
 
 
-def backtest_comparison(results: dict[str, dict[str, Metrics]], ranking: list[str]) -> str:
-    lines = ["Backtest results (best first). Out-of-sample = recent period the strategy was not tuned on.", ""]
+def backtest_comparison(results: dict[str, dict[str, Metrics]], ranking: list[str],
+                        segments: dict[str, dict[str, str]] | None = None) -> str:
+    lines = ["Backtest results (best first). Out-of-sample = recent period the strategy was not tuned on."]
+    oos_seg = (segments or {}).get("out_of_sample")
+    if oos_seg:
+        lines.append(f"Out-of-sample period: {oos_seg['start']} to {oos_seg['end']}")
+    lines.append("")
     for i, name in enumerate(ranking, 1):
         oos, ins = results[name]["out_of_sample"], results[name]["in_sample"]
         head = f"{i}. {name}"
@@ -108,8 +126,12 @@ def backtest_comparison(results: dict[str, dict[str, Metrics]], ranking: list[st
             head,
             f"  Trades: {oos.trades}, win rate {_pct(oos.win_rate)}",
             f"  Average win {money(oos.avg_win)}, average loss {money(oos.avg_loss)}",
+            f"  Average profit per trade: {money(oos.expectancy)} "
+            f"({_pct(oos.expectancy_pct)} of the amount invested)",
             f"  Worst fall from a peak: {_pct(oos.max_drawdown)}",
             f"  {_vs_bench(oos).capitalize()}",
+            f"  Per year (annualised): {_pct(oos.cagr)} vs Nifty {_pct(oos.benchmark_cagr)}",
+            f"  Total trading costs: {money(oos.total_costs)}",
             f"  After tax: {_pct(oos.post_tax_return)} vs Nifty {_pct(oos.benchmark_post_tax_return)}",
             f"  Safety switch tripped: {oos.kill_switch_trips} time(s)",
             f"  Earlier (in-sample) period: {_vs_bench(ins)}",

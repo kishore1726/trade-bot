@@ -15,7 +15,7 @@ from pathlib import Path
 
 import httpx
 
-from tradebot.backtest import rank, walk_forward
+from tradebot.backtest import rank, segment_dates, walk_forward
 from tradebot.bot import run_bot
 from tradebot.config import load_config
 from tradebot.daily import run_daily
@@ -116,12 +116,16 @@ def cmd_backtest(cfg, store, start: date) -> int:
         return 1
     results = walk_forward(sorted(REGISTRY), bars, cfg)
     ranking = rank(results, cfg)
+    # "segments" is an optional key added to the R4 shape (I6); older summaries lack it.
+    segments = {s: {"start": a.isoformat(), "end": b.isoformat()}
+                for s, (a, b) in segment_dates(bars).items()}
     store.set("backtest_summary", {
         "results": {n: {seg: asdict(m) for seg, m in segs.items()} for n, segs in results.items()},
         "ranking": ranking,
         "generated": _today().isoformat(),
+        "segments": segments,
     })
-    text = backtest_comparison(results, ranking)
+    text = backtest_comparison(results, ranking, segments)
     print(text)
     send(text, store)
     return 0

@@ -27,10 +27,12 @@ from tradebot.backtest import DayResult, DayState, step_day
 from tradebot.calendar import (HolidayFileError, is_trading_day, previous_trading_day,
                                trading_days_between)
 from tradebot.config import Config
+from tradebot.costs import trade_cost
 from tradebot.data import BAD, Bars, day_problems, fetch_bars
 from tradebot.metrics import Metrics, compute_metrics
 from tradebot.notify import send
 from tradebot.portfolio import Portfolio
+from tradebot.risk import size_position
 from tradebot.store import IST, Store
 from tradebot.strategies import REGISTRY, Signal
 
@@ -305,6 +307,46 @@ def _critical_text(d: date, tickers: list[str], cfg: Config) -> str:
     return reports.alert("\n".join(lines))
 
 
+def _estimates(signals: list[Signal], portfolio: Portfolio, equity: float, bars: Bars, d: date,
+               paused: bool, kill_switch: bool, cfg: Config) -> dict[str, tuple]:
+    """I7: what each BUY for tomorrow would roughly be, using step_day's rules at today's close
+    (SELLs first, then BUYs in order with size_position). Real fills use tomorrow's open."""
+    ts = pd.Timestamp(d)
+
+    def close(t: str) -> float | None:
+        df = bars.get(t)
+        c = df["close"][df.index <= ts] if df is not None else None
+        return float(c.iloc[-1]) if c is not None and len(c) else None
+
+    p = copy.deepcopy(portfolio)
+    for s in signals:
+        if s.action == "SELL" and s.ticker in p.positions and close(s.ticker) is not None:
+            p.sell(s.ticker, close(s.ticker), d, "estimate", cfg)
+    out: dict[str, tuple] = {}
+    for s in (s for s in signals if s.action == "BUY"):
+        price = close(s.ticker)
+        if paused:
+            out[s.ticker] = ("will", "paused - send /resume to allow buys")
+        elif kill_switch:
+            out[s.ticker] = ("will", "safety switch is on - send /resume to allow buys")
+        elif s.ticker in p.positions:
+            out[s.ticker] = ("will", "already held")
+        elif len(p.positions) >= cfg.max_positions:
+            out[s.ticker] = ("will", f"no free slot (already holding {cfg.max_positions} positions)")
+        elif price is None or s.stop is None:
+            out[s.ticker] = ("may", "no price or stop yet")
+        else:
+            entry = price * (1 + cfg.slippage_pct)
+            qty, reason = size_position(equity, p.cash, entry, s.stop, len(p.positions), cfg)
+            if qty == 0:
+                out[s.ticker] = ("may", reason or "position size is zero")
+                continue
+            out[s.ticker] = (qty, qty * entry)
+            p.cash -= qty * entry + trade_cost("BUY", qty * entry, cfg.costs)
+            p.positions[s.ticker] = None  # takes a slot
+    return out
+
+
 def _check_day(d: date, tickers: list[str], bars: Bars, held: set[str],
                cfg: Config) -> tuple[str | None, dict[str, date | None]]:
     """(halt alert text or None, tickers to leave out for d with their last bar date)."""
@@ -456,10 +498,15 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
         # I3: exits and skipped orders from EVERY processed day, not just the last one.
         exits = [tr for x in traded for tr in x.result.sells + x.result.stop_exits]
         skipped = [(x.result.d, tk, why) for x in traded for tk, why in x.result.skipped]
+        final = Portfolio.from_dict(traded[-1].portfolio)
+        prev = [k for k in history if k < last_r.d.isoformat()]
         sender(reports.daily_summary(
-            last_r.d, Portfolio.from_dict(traded[-1].portfolio), last_r.equity, last_r.new_signals,
+            last_r.d, final, last_r.equity, last_r.new_signals,
             exits, [x.result.d for x in traded[:-1]], name,
-            _below_benchmark(store, name), skipped=skipped, notes=notes), store)
+            _below_benchmark(store, name), skipped=skipped, notes=notes,
+            estimates=_estimates(last_r.new_signals, final, last_r.equity, bars, last_r.d,
+                                 state.paused, traded[-1].kill_switch, cfg),
+            previous_equity=history[max(prev)] if prev else None), store)
 
     def weekly() -> None:
         week_ends = [x.result.d for x in traded if _last_day_of_week(x.result.d, cfg)]

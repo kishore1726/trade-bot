@@ -65,7 +65,7 @@ def _report(store: Store) -> str:
         results = {n: {k: Metrics.from_dict(v) for k, v in r.items()}
                    for n, r in summ["results"].items()}
         ranking = [n for n in summ.get("ranking") or results if n in results]
-        return backtest_comparison(results, ranking)
+        return backtest_comparison(results, ranking, summ.get("segments"))
     return NO_REPORT
 
 
@@ -88,16 +88,25 @@ def _resume(cfg: Config, store: Store) -> str:
         raw = store.get("portfolio")
         if not raw and not store.get("chosen_strategy"):
             return "Nothing to resume yet: no strategy has been chosen. Send /choose <name> first."
-        p = Portfolio.from_dict(raw) if raw else Portfolio(cfg.capital)
-        hist = store.get("equity_history") or {}
-        p.peak_equity = (float(hist[max(hist)]) if hist else
-                         p.cash + sum(x.qty * x.entry_price for x in p.positions.values()))
+        paused, killed = bool(store.get("paused")), bool(store.get("kill_switch"))
+        if not paused and not killed:
+            return "Nothing to resume: new buys were not paused and the safety switch is off. Nothing changed."
+        cleared = []
         _bump_rev(store)
+        if killed:  # I8: only a tripped safety switch restarts its high-water mark
+            p = Portfolio.from_dict(raw) if raw else Portfolio(cfg.capital)
+            hist = store.get("equity_history") or {}
+            p.peak_equity = (float(hist[max(hist)]) if hist else
+                             p.cash + sum(x.qty * x.entry_price for x in p.positions.values()))
+            store.set("portfolio", p.to_dict())
+            cleared.append(f"the safety switch (it now measures falls from {money(p.peak_equity)}, "
+                           "today's value)")
+        if paused:
+            cleared.append("the pause")
         store.set("paused", False)
         store.set("kill_switch", False)
-        store.set("portfolio", p.to_dict())
-        store.log_event("resume", {"peak_equity": p.peak_equity})
-    return "Resumed. The safety switch and pause are cleared; new buys resume tomorrow."
+        store.log_event("resume", {"cleared_kill_switch": killed, "cleared_pause": paused})
+    return f"Resumed. Cleared {' and '.join(cleared)}. New buys resume tomorrow."
 
 
 def _choose(arg: str, cfg: Config, store: Store, today: date) -> str:
