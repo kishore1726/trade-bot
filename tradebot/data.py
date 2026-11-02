@@ -25,6 +25,10 @@ IST = ZoneInfo("Asia/Kolkata")
 # Ruling R12: before this IST time today's bar may be partial (market still open / not settled),
 # so it is never returned or cached.
 DAY_BAR_READY = time(16, 0)
+# Ruling R23: Yahoo re-adjusts a ticker's whole price history after a split, bonus issue or
+# dividend. If a re-downloaded bar we already cached differs by more than this, the cached
+# history is stale: it is rebuilt from scratch and the ratio new/old close is reported.
+ADJUST_TOLERANCE = 0.005
 
 
 def _ist_now() -> datetime:
@@ -78,6 +82,20 @@ def _read_cache(path) -> pd.DataFrame:
     return _normalise(df)
 
 
+def _adjustment(cached: pd.DataFrame, parts: list[pd.DataFrame]) -> float | None:
+    """new_close / old_close on the latest re-downloaded bar that moved more than the tolerance."""
+    worst: tuple[pd.Timestamp, float] | None = None
+    for part in parts:
+        common = part.index.intersection(cached.index)
+        if common.empty:
+            continue
+        ratio = part.loc[common, "close"] / cached.loc[common, "close"]
+        moved = ratio[(ratio - 1).abs() > ADJUST_TOLERANCE]
+        if not moved.empty and (worst is None or moved.index[-1] > worst[0]):
+            worst = (moved.index[-1], float(moved.iloc[-1]))
+    return None if worst is None else worst[1]
+
+
 def fetch_bars(
     tickers: list[str],
     start: date,
@@ -85,8 +103,12 @@ def fetch_bars(
     cfg: Config,
     source: Callable[[str, date, date], pd.DataFrame] | None = None,
     now: Callable[[], datetime] | None = None,
+    adjustments: dict[str, float] | None = None,
 ) -> Bars:
-    """`now` returns the current time (IST if naive); default is the real clock."""
+    """`now` returns the current time (IST if naive); default is the real clock.
+
+    If `adjustments` is given, it receives {ticker: new_close / old_close} for every ticker whose
+    cache had to be rebuilt because Yahoo re-adjusted its history (Ruling R23)."""
     source = source or yfinance_source
     partial = _partial_day((now or _ist_now)())
     if partial is not None:
@@ -122,6 +144,12 @@ def fetch_bars(
                 gaps = [d for d in needed[-GAP_WINDOW:] if d not in have and first < d < last]
                 if gaps:
                     parts.append(fetch(t, gaps[0], gaps[-1]))
+                ratio = _adjustment(cached, parts[1:])
+                if ratio is not None:  # history re-adjusted: rebuild this ticker from scratch
+                    parts = [_normalise(None), fetch(t, min(first, start), end)]
+                    cached = _normalise(None)
+                    if adjustments is not None:
+                        adjustments[t] = ratio
             if len(parts) > 1:
                 merged = _normalise(pd.concat(parts))
                 dirty = dirty or not merged.equals(cached)

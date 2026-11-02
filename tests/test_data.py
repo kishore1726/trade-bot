@@ -214,3 +214,46 @@ def test_todays_bar_used_after_close(tmp_path):
     out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 4), cfg,
                      source=lambda *a: frame(["2026-11-02", "2026-11-03", "2026-11-04"]), now=after)
     assert out["A.NS"].index[-1] == pd.Timestamp("2026-11-04")
+
+
+# --- C2 / Ruling R23 ----------------------------------------------------------------------
+
+def test_split_rebuilds_cache_and_reports_ratio(tmp_path):
+    """Reviewer probe: a 1:2 split re-adjusts Yahoo's whole history; the cached pre-split bars
+    must not be glued to post-split bars (fake ~50% fall)."""
+    cfg = cfg_in(tmp_path)
+    old_days = list(pd.bdate_range("2026-10-01", "2026-10-30"))
+    all_days = list(pd.bdate_range("2026-10-01", "2026-11-06"))
+    calls = []
+
+    def src(t, s, e):
+        calls.append((s, e))
+        if len(calls) == 1:
+            return frame(old_days, open=2000.0, high=2000.0, low=2000.0, close=2000.0)
+        df = frame(all_days, open=1000.0, high=1000.0, low=1000.0, close=1000.0)
+        return df[(df.index >= pd.Timestamp(s)) & (df.index <= pd.Timestamp(e))]
+
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 10, 30), cfg, source=src)
+    adj = {}
+    out = fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 11, 6), cfg, source=src, adjustments=adj)
+    assert adj == {"X.NS": pytest.approx(0.5)}
+    assert (out["X.NS"]["close"] == 1000.0).all() and len(out["X.NS"]) == len(all_days)
+    assert calls[-1] == (date(2026, 10, 1), date(2026, 11, 6))  # full rebuild
+    cached = pd.read_csv(cfg.data_dir / "X.NS.csv", index_col=0, parse_dates=True)
+    assert (cached["close"] == 1000.0).all()
+
+
+def test_tiny_overlap_difference_is_not_an_adjustment(tmp_path):
+    cfg = cfg_in(tmp_path)
+    calls = []
+
+    def src(t, s, e):
+        calls.append((s, e))
+        if len(calls) == 1:
+            return frame(["2026-11-02", "2026-11-03"])
+        return frame(["2026-11-03", "2026-11-04"], close=105.3)  # 0.29% off: rounding noise
+
+    fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 3), cfg, source=src)
+    adj = {}
+    out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 4), cfg, source=src, adjustments=adj)
+    assert adj == {} and len(calls) == 2 and len(out["A.NS"]) == 3

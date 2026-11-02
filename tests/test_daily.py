@@ -57,9 +57,13 @@ class FakeFetch:
     def __init__(self, bars, error=None):
         self.bars, self.error, self.calls = bars, error, []
 
+    adjust: dict = {}  # what fetch_bars would report as price adjustments (C2 / R23)
+
     def __call__(self, tickers, start, end, cfg, now=None, adjustments=None):
         self.calls.append((list(tickers), start, end))
         self.now = now
+        if adjustments is not None:
+            adjustments.update(self.adjust)
         if self.error:
             raise self.error
         lo, hi = pd.Timestamp(start), pd.Timestamp(end)
@@ -537,3 +541,55 @@ def test_weekly_report_sent_when_friday_was_unlisted_holiday(cfg, store, scripte
     run(date(2024, 1, 8), cfg, store, FakeFetch(bars), s)
     assert len([m for m in s.messages if m.startswith("Weekly report")]) == 1
     assert store.get("last_weekly_week") == "2024-W01"
+
+
+# --- C2 / Ruling R23: splits, bonus issues, dividends ------------------------------------
+
+def _hold_a(cfg, store, qty=10, price=100.0, stop=90.0):
+    p = Portfolio(cfg.capital)
+    p.buy("A.NS", qty, price, MON, stop, "scripted", cfg)
+    store.set("portfolio", p.to_dict())
+    return p.positions["A.NS"]
+
+
+def test_split_rescales_held_position(cfg, store, scripted):
+    start_paper(store, MON)
+    before = _hold_a(cfg, store)
+    bars = flat_bars(price=50.0)  # history re-adjusted by Yahoo after a 1:2 split
+    fetch = FakeFetch(bars)
+    fetch.adjust = {"A.NS": 0.5, "B.NS": 0.5}  # B is not held: nothing to rescale
+    s = Sender()
+    assert run(TUE, cfg, store, fetch, s, now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST)) == [TUE]
+    (pos,) = store.get("portfolio")["positions"]
+    assert pos["qty"] == 20 and pos["entry_price"] == pytest.approx(before.entry_price * 0.5)
+    assert pos["stop"] == pytest.approx(45.0)
+    assert store.get("portfolio")["trades"] == []  # no fake stop-out
+    (ev,) = store.events("price_adjustment")
+    assert ev["payload"]["ticker"] == "A.NS" and ev["payload"]["ratio"] == 0.5
+    assert ev["payload"]["qty_before"] == 10 and ev["payload"]["qty_after"] == 20
+    assert "A.NS" in s.messages[-1] and "split" in s.messages[-1]
+
+
+def test_dividend_like_adjustment_scales_prices_only(cfg, store, scripted):
+    start_paper(store, MON)
+    before = _hold_a(cfg, store)
+    fetch = FakeFetch(flat_bars(price=98.0))
+    fetch.adjust = {"A.NS": 0.98}
+    s = Sender()
+    run(TUE, cfg, store, fetch, s, now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST))
+    (pos,) = store.get("portfolio")["positions"]
+    assert pos["qty"] == 10 and pos["entry_price"] == pytest.approx(before.entry_price * 0.98)
+    assert pos["stop"] == pytest.approx(90.0 * 0.98)
+    assert "dividend" in s.messages[-1]
+
+
+def test_adjustment_saved_even_when_day_cannot_be_processed(cfg, store, scripted):
+    """The cache is already rebuilt, so the ratio cannot be detected again on a later run."""
+    start_paper(store, MON)
+    _hold_a(cfg, store)
+    bars = flat_bars(price=50.0)
+    bars[BENCH] = bars[BENCH].drop(pd.Timestamp(TUE))
+    fetch = FakeFetch(bars)
+    fetch.adjust = {"A.NS": 0.5}
+    assert run(TUE, cfg, store, fetch, Sender(), now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST)) == []
+    assert store.get("portfolio")["positions"][0]["qty"] == 20

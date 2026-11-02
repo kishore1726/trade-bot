@@ -38,6 +38,9 @@ from tradebot.strategies import REGISTRY, Signal
 RUN_AFTER = time(16, 15)
 WARMUP_DAYS = 450  # calendar days of history before the first processed day (SMA200 etc.)
 MAX_PROBLEM_LINES = 10
+# Ruling R23: a price-adjustment ratio this far from 1 is a split/bonus (shares change);
+# anything closer is dividend-like (only prices change).
+SPLIT_LOW, SPLIT_HIGH = 0.83, 1.2
 
 ERROR_TEXT = ("Something went wrong in tonight's run. Nothing was traded. "
               "Details saved in the log file.")
@@ -199,6 +202,50 @@ def _holiday_note(d: date) -> str:
     return f"Market was closed on {d.isoformat()} (holiday not in my list)."
 
 
+def _apply_adjustments(store: Store, adj: dict[str, float]) -> list[str]:
+    """Ruling R23: rescale held positions (and pending stops) to Yahoo's re-adjusted prices.
+
+    Saved in its own transaction straight after the download, not with a day's save: the cache
+    is already rebuilt, so if no day can be processed tonight the ratio would be lost for ever.
+    Returns plain-English notes for the summary."""
+    if not adj:
+        return []
+    notes: list[str] = []
+    with store.transaction():
+        raw = store.get("portfolio")
+        p = Portfolio.from_dict(raw) if raw else None
+        for t, r in sorted(adj.items()):
+            pos = p.positions.get(t) if p else None
+            if pos is None:
+                continue
+            split = r <= SPLIT_LOW or r >= SPLIT_HIGH
+            q0 = pos.qty
+            if split:
+                pos.qty = max(1, round(q0 / r))
+            pos.entry_price *= r
+            pos.stop *= r
+            store.log_event("price_adjustment", {"ticker": t, "ratio": r, "qty_before": q0,
+                                                 "qty_after": pos.qty, "kind": "split" if split else "dividend"})
+            head = f"{t}: Yahoo adjusted its past prices by a factor of {r:.4g}"
+            if split:
+                notes.append(f"{head} (looks like a share split or bonus issue). Your paper position "
+                             f"was changed from {q0} to {pos.qty} shares, bought at "
+                             f"{reports.money(pos.entry_price)}, stop {reports.money(pos.stop)}.")
+            else:
+                notes.append(f"{head} (looks like a dividend or a similar small change). The "
+                             f"bought-at price and stop were scaled to match "
+                             f"({reports.money(pos.entry_price)}, stop {reports.money(pos.stop)}); "
+                             "the number of shares is unchanged.")
+        pending = store.get("pending_signals") or []
+        for sig in pending:
+            if sig.get("ticker") in adj and sig.get("stop") is not None:
+                sig["stop"] *= adj[sig["ticker"]]
+        if p is not None and notes:
+            store.set("portfolio", p.to_dict())
+        store.set("pending_signals", pending)
+    return notes
+
+
 def _unlisted_holiday(d: date, tickers: list[str], bars: Bars, cfg: Config) -> bool:
     """Ruling R22: no ticker has a bar on d, but the benchmark has a bar on a later day."""
     ts = pd.Timestamp(d)
@@ -236,13 +283,18 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
     # Held tickers too, in case one was removed from the universe while still held.
     tickers = list(dict.fromkeys(cfg.universe + [cfg.benchmark] + list(portfolio.positions)))
     start = min(days[0] - timedelta(days=WARMUP_DAYS), paper_start)
+    adj: dict[str, float] = {}
     try:
-        bars = fetch(tickers, start, days[-1], cfg, now=lambda: t)  # same clock as the cutoff
+        bars = fetch(tickers, start, days[-1], cfg, now=lambda: t,  # same clock as the cutoff
+                     adjustments=adj)
     except Exception:
         _log_exception(cfg, "market data download failed")
         sender(reports.alert("Could not download market data tonight. Nothing was traded; "
                              "I'll try again on the next run."), store)
         return []
+    notes = _apply_adjustments(store, adj)
+    if notes:
+        portfolio = Portfolio.from_dict(store.get("portfolio"))
 
     # Compute every day in memory first (pure), so an error here changes nothing stored.
     state = DayState(
@@ -299,7 +351,7 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
             _log_exception(cfg, f"{what} failed")
 
     traded = [x for x in done if x.result is not None]
-    notes = [_holiday_note(x.holiday) for x in done if x.holiday is not None]
+    notes += [_holiday_note(x.holiday) for x in done if x.holiday is not None]
 
     def kill_alerts() -> None:
         for day in traded:
