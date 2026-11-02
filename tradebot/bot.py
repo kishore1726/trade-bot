@@ -77,11 +77,14 @@ def _pause(store: Store) -> str:
 
 
 def _resume(cfg: Config, store: Store) -> str:
-    p = _portfolio(store, cfg)
-    hist = store.get("equity_history") or {}
-    p.peak_equity = (float(hist[max(hist)]) if hist else
-                     p.cash + sum(x.qty * x.entry_price for x in p.positions.values()))
-    with store.transaction():
+    with store.transaction():  # read and write under one lock: the daily run is another process
+        raw = store.get("portfolio")
+        if not raw and not store.get("chosen_strategy"):
+            return "Nothing to resume yet: no strategy has been chosen. Send /choose <name> first."
+        p = Portfolio.from_dict(raw) if raw else Portfolio(cfg.capital)
+        hist = store.get("equity_history") or {}
+        p.peak_equity = (float(hist[max(hist)]) if hist else
+                         p.cash + sum(x.qty * x.entry_price for x in p.positions.values()))
         store.set("paused", False)
         store.set("kill_switch", False)
         store.set("portfolio", p.to_dict())
@@ -90,27 +93,38 @@ def _resume(cfg: Config, store: Store) -> str:
 
 
 def _choose(arg: str, cfg: Config, store: Store, today: date) -> str:
-    summ = store.get("backtest_summary")
-    names = list((summ or {}).get("results") or {})
-    if not names:
-        return "No backtest results yet. Run the backtest first, then send /choose <name>."
-    if not arg:
-        return f"Which one? Send /choose <name> with one of: {', '.join(names)}."
-    if arg not in names:
-        return f"I don't know \"{arg}\". Choose one of: {', '.join(names)}."
-    current = store.get("chosen_strategy")
-    if current == arg:
-        return f"{arg} is already your chosen strategy. Nothing changed."
-    p = _portfolio(store, cfg)
-    if p.positions:
-        return (f"Can't switch to {arg} while positions are open (they belong to {current or 'the current strategy'}). "
-                "Wait until they are all sold, then try again.")
-    with store.transaction():
-        if not store.get("portfolio"):
-            store.set("portfolio", Portfolio(cfg.capital).to_dict())
+    with store.transaction():  # read and write under one lock: the daily run is another process
+        summ = store.get("backtest_summary")
+        names = list((summ or {}).get("results") or {})
+        if not names:
+            return "No backtest results yet. Run the backtest first, then send /choose <name>."
+        if not arg:
+            return f"Which one? Send /choose <name> with one of: {', '.join(names)}."
+        if arg not in names:
+            return f"I don't know \"{arg}\". Choose one of: {', '.join(names)}."
+        current = store.get("chosen_strategy")
+        if current == arg:
+            return f"{arg} is already your chosen strategy. Nothing changed."
+        raw = store.get("portfolio")
+        p = Portfolio.from_dict(raw) if raw else Portfolio(cfg.capital)
+        if p.positions:
+            return (f"Can't switch to {arg} while positions are open (they belong to "
+                    f"{current or 'the current strategy'}). Wait until they are all sold, then try again.")
+        switched = current is not None
+        if switched:  # Ruling R20: a different strategy starts a fresh paper record
+            store.log_event("strategy_switch", {"from": current, "to": arg,
+                                                "trades": p.to_dict()["trades"]})
+            p.trades.clear()
+            p.peak_equity = p.cash
+            store.set("pending_signals", [])
+            store.set("equity_history", {})
+        store.set("portfolio", p.to_dict())
         store.set("chosen_strategy", arg)
         store.set("last_processed_day", previous_trading_day(today, cfg).isoformat())
         store.log_event("choose", {"strategy": arg})
+    if switched:
+        return (f"Switched from {current} to {arg}. A fresh paper record has started "
+                "(the old trades are saved in the log). Paper trading starts with the next trading day.")
     return f"Chosen: {arg}. Paper trading starts with the next trading day."
 
 

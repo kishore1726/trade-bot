@@ -79,10 +79,11 @@ def test_status_empty(cfg, store):
 
 def test_pause_resume_flags(cfg, store):
     out = cmd("/pause", cfg, store)
-    assert store.get("paused") is True
+    assert store.get("paused") is True and store.get("kill_switch") is None
     assert "stop" in out.lower()
     assert store.events("pause")
     store.set("kill_switch", True)
+    store.set("chosen_strategy", "momentum")
     out = cmd("/resume", cfg, store)
     assert store.get("paused") is False and store.get("kill_switch") is False
     assert "tomorrow" in out
@@ -225,3 +226,73 @@ def test_missing_credentials(cfg, store, monkeypatch):
     with pytest.raises(SystemExit) as e:
         bot.run_bot(cfg, store, http=FakeHttp())
     assert "TELEGRAM" in str(e.value)
+
+
+def test_resume_with_nothing_chosen_creates_nothing(cfg, store):
+    store.set("paused", True)
+    out = cmd("/resume", cfg, store)
+    assert "Nothing to resume" in out
+    assert store.get("portfolio") is None
+    assert not store.events("resume")
+
+
+def test_resume_preserves_latest_portfolio(cfg, store):
+    p = Portfolio(7777)
+    p.trades.clear()
+    store.set("portfolio", p.to_dict())
+    store.set("chosen_strategy", "momentum")
+    cmd("/resume", cfg, store)
+    q = Portfolio.from_dict(store.get("portfolio"))
+    assert q.cash == 7777 and q.peak_equity == 7777
+
+
+def test_commands_read_inside_transaction(cfg, store):
+    depth = {"n": 0, "reads": []}
+    orig_tx, orig_get = store.transaction, store.get
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def tx():
+        with orig_tx():
+            depth["n"] += 1
+            try:
+                yield
+            finally:
+                depth["n"] -= 1
+
+    def get(key, default=None):
+        depth["reads"].append((key, depth["n"]))
+        return orig_get(key, default)
+
+    store.transaction, store.get = tx, get
+    store.set("backtest_summary", summary("momentum"))
+    store.set("chosen_strategy", "momentum")
+    store.set("portfolio", Portfolio(1000).to_dict())
+    cmd("/resume", cfg, store)
+    cmd("/choose momentum", cfg, store)
+    assert depth["reads"] and all(n == 1 for k, n in depth["reads"]
+                                  if k in ("portfolio", "equity_history", "chosen_strategy"))
+
+
+def test_switch_strategy_starts_fresh_record(cfg, store):
+    store.set("backtest_summary", summary("momentum", "other"))
+    store.set("chosen_strategy", "momentum")
+    p = Portfolio(15000)
+    p.peak_equity = 20000
+    from tradebot.portfolio import Trade
+    p.trades.append(Trade("A.NS", 5, date(2024, 1, 1), 100.0, date(2024, 1, 2), 90.0, 10.0, -60.0, "stop"))
+    store.set("portfolio", p.to_dict())
+    store.set("pending_signals", [{"x": 1}])
+    store.set("equity_history", {"2024-01-02": 15000.0})
+    out = cmd("/choose other", cfg, store)
+    assert "fresh" in out
+    assert store.get("chosen_strategy") == "other"
+    assert store.get("pending_signals") == []
+    assert store.get("equity_history") == {}
+    q = Portfolio.from_dict(store.get("portfolio"))
+    assert q.trades == [] and q.cash == 15000 and q.peak_equity == 15000
+    ev = store.events("strategy_switch")[0]["payload"]
+    assert ev["from"] == "momentum" and ev["to"] == "other" and len(ev["trades"]) == 1
+    assert ev["trades"][0]["ticker"] == "A.NS"
+    assert store.get("last_processed_day") == "2024-01-02"
