@@ -116,3 +116,5 @@ def test_metrics_round_trip(cfg):
     d = json.loads(json.dumps(asdict(m)))
     assert Metrics.from_dict(d) == m
     assert Metrics.from_dict(asdict(replace(m, trades=7))).trades == 7
+    m3 = replace(m, kill_switch_trips=3)
+    assert Metrics.from_dict(json.loads(json.dumps(asdict(m3)))) == m3

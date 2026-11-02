@@ -202,3 +202,48 @@ def test_rank_order(cfg):
         "tie": {"in_sample": ins, "out_of_sample": _m(0.15, 100.0, 0.5, 0.3)},
     }
     assert rank(results, cfg) == ["beatbench", "tie", "lowexp", "deep"]
+
+
+
+DAYS40 = pd.bdate_range("2024-01-01", periods=40)
+
+
+def flat_frame(opens):
+    return pd.DataFrame({"open": opens, "high": opens, "low": opens, "close": opens,
+                         "volume": 1000.0}, index=DAYS40, dtype=float)
+
+
+def resume_case():
+    """A bought day 1 (fill), gaps 100->70 on day 2: kill switch trips. A sold day 4.
+    B is signalled every day from day 2; B gaps 50->30 on day 26 (stop 40) -> exits at open."""
+    n = len(DAYS40)
+    bars = {"A.NS": flat_frame([100.0, 100.0] + [70.0] * (n - 2)),
+            "B.NS": flat_frame([50.0] * 26 + [30.0] * (n - 26)),
+            "NB.NS": flat_frame([100.0] * n)}
+    d = [x.date() for x in DAYS40]
+    sched = {d[0]: [Signal("A.NS", "BUY", 1.0, "go")]}
+    for i in range(2, n):
+        sched[d[i]] = [Signal("B.NS", "BUY", 40.0, "go")]
+    sched[d[3]] = sched[d[3]] + [Signal("A.NS", "SELL", None, "exit")]
+    return bars, sched, d
+
+
+def test_backtest_resumes_after_20_days_and_counts_trips(cfg):
+    cfg = replace(cfg, max_position_pct=1.0, max_risk_pct=1.0)
+    bars, sched, d = resume_case()
+    m, equity, trades = run_backtest(Stub(sched), bars, d[0], d[-1], cfg)
+    # trip on day 2; BUY fills blocked on days 3..22; first fill allowed on day 23
+    assert [(t.ticker, t.entry_date, t.exit_date) for t in trades] == [
+        ("A.NS", d[1], d[4]), ("B.NS", d[23], d[26])]
+    # B's 40% gap loss after the resume trips again, measured from the reset peak
+    assert m.kill_switch_trips == 2
+
+
+def test_step_day_never_auto_resumes(cfg):
+    # The paper run (step_day alone) keeps the kill switch until the owner sends /resume.
+    cfg = replace(cfg, max_position_pct=1.0, max_risk_pct=1.0)
+    bars, sched, d = resume_case()
+    s, strat = DayState(Portfolio(cfg.capital), []), Stub(sched)
+    results = [step_day(s, day, bars, strat, cfg) for day in d]
+    assert [i for i, r in enumerate(results) if r.kill_tripped_today] == [2]
+    assert all(not r.buys for r in results[2:]) and s.kill_switch

@@ -28,6 +28,7 @@ class Metrics:
     post_tax_return: float
     benchmark_post_tax_return: float
     below_benchmark: bool
+    kill_switch_trips: int = 0  # backtest only: times the drawdown kill switch tripped
 
     @classmethod
     def from_dict(cls, d: dict) -> "Metrics":
@@ -82,9 +83,9 @@ def _benchmark(close: pd.Series, open_price: float | None, start: float, cfg: Co
 
 def compute_metrics(trades: list[Trade], equity: pd.Series, benchmark_close: pd.Series,
                     start_capital: float, cfg: Config,
-                    benchmark_open: float | None = None) -> Metrics:
+                    benchmark_open: float | None = None, kill_switch_trips: int = 0) -> Metrics:
     """`benchmark_open` is the benchmark's open on the first day (the buy price);
-    when omitted the first benchmark close is used."""
+    when omitted the first benchmark close is used. `kill_switch_trips` is passed through."""
     pnls = [t.pnl for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
@@ -119,4 +120,5 @@ def compute_metrics(trades: list[Trade], equity: pd.Series, benchmark_close: pd.
         benchmark_post_tax_return=float(b_post),
         # Conservative: below if it trails the benchmark before OR after estimated tax.
         below_benchmark=bool(total_return < b_ret or post_tax_return < b_post),
+        kill_switch_trips=int(kill_switch_trips),
     )

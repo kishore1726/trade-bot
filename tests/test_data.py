@@ -1,8 +1,11 @@
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
+import pytest
+
+import tradebot.data as data_mod
 
 from tradebot.config import load_config
 from tradebot.data import fetch_bars, validate_day
@@ -20,6 +23,12 @@ def frame(dates, **over):
     for k, v in over.items():
         df[k] = v
     return df
+
+
+@pytest.fixture(autouse=True)
+def _after_close(monkeypatch):
+    # Pin "now" after every test date's close so the R12 intraday clip never interferes.
+    monkeypatch.setattr(data_mod, "_ist_now", lambda: datetime(2026, 12, 31, 20, 0, tzinfo=data_mod.IST))
 
 
 def cfg_in(tmp_path):
@@ -168,3 +177,40 @@ def test_interior_gap_within_window_is_filled(tmp_path):
     out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 6), cfg, source=src)
     assert len(calls) == 2 and calls[1][0] <= date(2026, 11, 3) <= calls[1][1]
     assert len(out["A.NS"]) == 5
+
+
+def test_no_partial_bar_before_close(tmp_path):
+    cfg = cfg_in(tmp_path)
+    calls = []
+
+    def src(t, s, e):
+        calls.append((s, e))
+        return frame(["2026-11-02", "2026-11-03", "2026-11-04"])  # source wrongly includes today
+
+    at_noon = lambda: datetime(2026, 11, 4, 12, 30, tzinfo=data_mod.IST)  # noqa: E731
+    out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 4), cfg, source=src, now=at_noon)
+    assert calls[0][1] == date(2026, 11, 3)  # end clipped to yesterday
+    assert out["A.NS"].index[-1] == pd.Timestamp("2026-11-03")
+    cached = pd.read_csv(cfg.data_dir / "A.NS.csv", index_col=0, parse_dates=True)
+    assert cached.index[-1] == pd.Timestamp("2026-11-03")
+
+
+def test_partial_bar_cached_earlier_is_purged(tmp_path):
+    cfg = cfg_in(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    frame(["2026-11-02", "2026-11-03", "2026-11-04"]).rename_axis("date").to_csv(
+        cfg.data_dir / "A.NS.csv")
+    at_noon = lambda: datetime(2026, 11, 4, 9, 0)  # naive = IST  # noqa: E731
+    out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 4), cfg,
+                     source=lambda *a: frame([]), now=at_noon)
+    assert out["A.NS"].index[-1] == pd.Timestamp("2026-11-03")
+    cached = pd.read_csv(cfg.data_dir / "A.NS.csv", index_col=0, parse_dates=True)
+    assert pd.Timestamp("2026-11-04") not in cached.index
+
+
+def test_todays_bar_used_after_close(tmp_path):
+    cfg = cfg_in(tmp_path)
+    after = lambda: datetime(2026, 11, 4, 16, 5, tzinfo=data_mod.IST)  # noqa: E731
+    out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 4), cfg,
+                     source=lambda *a: frame(["2026-11-02", "2026-11-03", "2026-11-04"]), now=after)
+    assert out["A.NS"].index[-1] == pd.Timestamp("2026-11-04")

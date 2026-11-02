@@ -19,6 +19,9 @@ from tradebot.risk import kill_switch_tripped, size_position
 from tradebot.strategies import REGISTRY, Signal, Strategy
 
 Segment = Literal["in_sample", "out_of_sample"]
+# Ruling R11: in backtests a kill-switch trip blocks new BUYs for this many trading days,
+# then the switch is reset and the peak set to current equity (simulated /resume).
+RESUME_AFTER_DAYS = 20
 
 
 @dataclass
@@ -138,7 +141,20 @@ def run_backtest(strategy: Strategy, bars: Bars, start: date, end: date,
     if cfg.benchmark not in bars:
         raise ValueError(f"no data for benchmark {cfg.benchmark}")
     state = DayState(Portfolio(cfg.capital), [])
-    values = [step_day(state, d, bars, strategy, cfg).equity for d in days]
+    values: list[float] = []
+    trips, resume_at = 0, None
+    for i, d in enumerate(days):
+        r = step_day(state, d, bars, strategy, cfg)
+        values.append(r.equity)
+        if r.kill_tripped_today:
+            trips += 1
+            resume_at = i + RESUME_AFTER_DAYS
+        # Ruling R11: simulate the owner's /resume after RESUME_AFTER_DAYS trading days of
+        # blocked BUY fills (the paper run itself never auto-resumes).
+        if state.kill_switch and resume_at is not None and i >= resume_at:
+            state.kill_switch = False
+            state.portfolio.peak_equity = r.equity
+            resume_at = None
     equity = pd.Series(values, index=pd.DatetimeIndex([pd.Timestamp(d) for d in days], name="date"),
                        dtype=float)
 
@@ -147,7 +163,7 @@ def run_backtest(strategy: Strategy, bars: Bars, start: date, end: date,
     trades = list(state.portfolio.trades)
     bench_open = float(bench["open"].iloc[0]) if not bench.empty else None
     metrics = compute_metrics(trades, equity, bench["close"], cfg.capital, cfg,
-                              benchmark_open=bench_open)
+                              benchmark_open=bench_open, kill_switch_trips=trips)
     return metrics, equity, trades
 
 
