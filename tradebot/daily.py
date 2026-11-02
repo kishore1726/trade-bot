@@ -34,7 +34,8 @@ from tradebot.calendar import (HolidayFileError, is_trading_day, previous_tradin
                                trading_days_between)
 from tradebot.config import Config
 from tradebot.costs import trade_cost
-from tradebot.data import BAD, MISSING, Bars, day_problems, fetch_bars
+from tradebot.data import (BAD, MISSING, Bars, day_problems, fetch_bars, forget_adjustments,
+                           pending_adjustments)
 from tradebot.metrics import Metrics, compute_metrics
 from tradebot.notify import send
 from tradebot.portfolio import Portfolio
@@ -248,19 +249,30 @@ def _holiday_note(d: date) -> str:
     return f"Market was closed on {d.isoformat()} (holiday not in my list)."
 
 
-def _apply_adjustments(store: Store, adj: dict[str, float]) -> list[str]:
+def _apply_adjustments(store: Store, cfg: Config) -> list[str]:
     """Ruling R23: rescale held positions (and pending stops) to Yahoo's re-adjusted prices.
 
-    Saved in its own transaction straight after the download, not with a day's save: the cache
-    is already rebuilt, so if no day can be processed tonight the ratio would be lost for ever.
-    Returns plain-English notes for the summary."""
-    if not adj:
+    The ratios come from the data ledger (data.ADJ_LEDGER), which fetch_bars writes before it
+    rebuilds a cache, whoever downloaded (this run, an earlier failed run, `tradebot backtest`).
+    Each ledger id is applied at most once: applied ids are saved in store key
+    "applied_adjustments" in the same transaction, then removed from the ledger. Saved in its own
+    transaction straight after the download, not with a day's save, so a night that processes no
+    day still applies them. Returns plain-English notes for the summary."""
+    ledger = pending_adjustments(cfg)
+    if not ledger:
         return []
     notes: list[str] = []
     with store.transaction():
+        done = set(store.get("applied_adjustments") or [])
+        todo = [e for e in ledger if e["id"] not in done]
         raw = store.get("portfolio")
         p = Portfolio.from_dict(raw) if raw else None
-        for t, r in sorted(adj.items()):
+        pending = store.get("pending_signals") or []
+        for e in todo:
+            t, r = e["ticker"], float(e["ratio"])
+            for sig in pending:
+                if sig.get("ticker") == t and sig.get("stop") is not None:
+                    sig["stop"] *= r
             pos = p.positions.get(t) if p else None
             if pos is None:
                 continue
@@ -282,13 +294,12 @@ def _apply_adjustments(store: Store, adj: dict[str, float]) -> list[str]:
                              f"bought-at price and stop were scaled to match "
                              f"({reports.money(pos.entry_price)}, stop {reports.money(pos.stop)}); "
                              "the number of shares is unchanged.")
-        pending = store.get("pending_signals") or []
-        for sig in pending:
-            if sig.get("ticker") in adj and sig.get("stop") is not None:
-                sig["stop"] *= adj[sig["ticker"]]
         if p is not None and notes:
             store.set("portfolio", p.to_dict())
         store.set("pending_signals", pending)
+        # Only ids still in the ledger can come back, so older ones need not be kept.
+        store.set("applied_adjustments", sorted(e["id"] for e in ledger))
+    forget_adjustments(cfg, [e["id"] for e in ledger])  # a crash here is harmless: ids are saved
     return notes
 
 
@@ -455,16 +466,17 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
     # Held tickers too, in case one was removed from the universe while still held.
     tickers = list(dict.fromkeys(cfg.universe + [cfg.benchmark] + held))
     start = min(days[0] - timedelta(days=WARMUP_DAYS), paper_start)
-    adj: dict[str, float] = {}
     try:
-        bars = fetch(tickers, start, days[-1], cfg, now=lambda: t,  # same clock as the cutoff
-                     adjustments=adj)
+        bars = fetch(tickers, start, days[-1], cfg, now=lambda: t)  # same clock as the cutoff
     except Exception:
         _log_exception(cfg, "market data download failed")
+        # Caches rebuilt before the failure must still rescale the paper positions now.
+        for note in _apply_adjustments(store, cfg):
+            sender(note, store)
         sender(reports.alert("Could not download market data tonight. Nothing was traded; "
                              "I'll try again on the next run."), store)
         return []
-    notes = _apply_adjustments(store, adj)
+    notes = _apply_adjustments(store, cfg)
 
     with store.transaction():  # one consistent snapshot of everything the run uses
         rev = store.get("state_rev", 0)

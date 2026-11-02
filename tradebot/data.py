@@ -7,6 +7,7 @@ Both start and end are INCLUSIVE. The frame has columns open/high/low/close/volu
 """
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, datetime, time, timedelta
 from typing import Callable
@@ -30,6 +31,12 @@ DAY_BAR_READY = time(16, 0)
 # dividend. If a re-downloaded bar we already cached differs by more than this, the cached
 # history is stale: it is rebuilt from scratch and the ratio new/old close is reported.
 ADJUST_TOLERANCE = 0.005
+# Ruling R23-amended (C2 residual): every detected adjustment is written to this ledger in the
+# data directory BEFORE the rebuilt cache replaces the old one, so the ratio survives a failed
+# download later in the run and a `tradebot backtest` download. Its id names the stale cached
+# bar, so detecting the same stale cache again (crash before the swap) adds nothing. The daily
+# run applies each id once (store key "applied_adjustments") and then removes it here.
+ADJ_LEDGER = "adjustments.json"
 
 
 def _ist_now() -> datetime:
@@ -83,8 +90,9 @@ def _read_cache(path) -> pd.DataFrame:
     return _normalise(df)
 
 
-def _adjustment(cached: pd.DataFrame, parts: list[pd.DataFrame]) -> float | None:
-    """new_close / old_close on the latest re-downloaded bar that moved more than the tolerance."""
+def _adjustment(cached: pd.DataFrame, parts: list[pd.DataFrame]) -> tuple[pd.Timestamp, float] | None:
+    """(date, new_close / old_close) on the latest re-downloaded bar that moved more than the
+    tolerance, or None."""
     worst: tuple[pd.Timestamp, float] | None = None
     for part in parts:
         common = part.index.intersection(cached.index)
@@ -94,7 +102,41 @@ def _adjustment(cached: pd.DataFrame, parts: list[pd.DataFrame]) -> float | None
         moved = ratio[(ratio - 1).abs() > ADJUST_TOLERANCE]
         if not moved.empty and (worst is None or moved.index[-1] > worst[0]):
             worst = (moved.index[-1], float(moved.iloc[-1]))
-    return None if worst is None else worst[1]
+    return worst
+
+
+def _write_atomic(path, write: Callable[[object], None]) -> None:
+    """write(tmp_path) a temp file, then swap it in, so a crash never leaves half a file."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def pending_adjustments(cfg: Config) -> list[dict]:
+    """Recorded, not yet forgotten adjustments: [{"id", "ticker", "ratio"}], oldest first."""
+    path = cfg.data_dir / ADJ_LEDGER
+    return json.loads(path.read_text()) if path.exists() else []
+
+
+def record_adjustment(cfg: Config, ticker: str, ratio: float, key: str) -> None:
+    """Add one adjustment to the ledger; an id already there is left as it is."""
+    entries = pending_adjustments(cfg)
+    if any(e["id"] == key for e in entries):
+        return
+    entries.append({"id": key, "ticker": ticker, "ratio": ratio})
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    _write_atomic(cfg.data_dir / ADJ_LEDGER, lambda p: p.write_text(json.dumps(entries, indent=1)))
+
+
+def forget_adjustments(cfg: Config, ids) -> None:
+    ids = set(ids)
+    entries = pending_adjustments(cfg)
+    keep = [e for e in entries if e["id"] not in ids]
+    if len(keep) != len(entries):
+        _write_atomic(cfg.data_dir / ADJ_LEDGER, lambda p: p.write_text(json.dumps(keep, indent=1)))
 
 
 def fetch_bars(
@@ -108,8 +150,9 @@ def fetch_bars(
 ) -> Bars:
     """`now` returns the current time (IST if naive); default is the real clock.
 
-    If `adjustments` is given, it receives {ticker: new_close / old_close} for every ticker whose
-    cache had to be rebuilt because Yahoo re-adjusted its history (Ruling R23)."""
+    Every ticker whose cache had to be rebuilt because Yahoo re-adjusted its history is recorded
+    in the adjustments ledger (see ADJ_LEDGER, Ruling R23). If `adjustments` is given, it also
+    receives {ticker: new_close / old_close} for them."""
     source = source or yfinance_source
     partial = _partial_day((now or _ist_now)())
     if partial is not None:
@@ -145,23 +188,27 @@ def fetch_bars(
                 gaps = [d for d in needed[-GAP_WINDOW:] if d not in have and first < d < last]
                 if gaps:
                     parts.append(fetch(t, gaps[0], gaps[-1]))
-                ratio = _adjustment(cached, parts[1:])
-                if ratio is not None:  # history re-adjusted: rebuild this ticker from scratch
-                    parts = [_normalise(None), fetch(t, min(first, start), end)]
-                    cached = _normalise(None)
-                    if adjustments is not None:
-                        adjustments[t] = ratio
+                moved = _adjustment(cached, parts[1:])
+                if moved is not None:  # history re-adjusted: rebuild this ticker from scratch
+                    at, ratio = moved
+                    rebuilt = fetch(t, min(first, start), end)
+                    if rebuilt.empty or rebuilt.index[-1] < cached.index[-1]:
+                        # Incomplete rebuild download: keep the old cache untouched and record
+                        # nothing; never glue new-basis bars to it. The next run tries again.
+                        parts = [cached]
+                    else:
+                        record_adjustment(cfg, t, ratio,
+                                          f"{t}|{at.date().isoformat()}|{float(cached.loc[at, 'close'])!r}")
+                        parts = [_normalise(None), rebuilt]
+                        cached = _normalise(None)
+                        if adjustments is not None:
+                            adjustments[t] = ratio
             if len(parts) > 1:
                 merged = _normalise(pd.concat(parts))
                 dirty = dirty or not merged.equals(cached)
                 cached = merged
-        if dirty:  # M6: write a temp file, then swap it in, so a crash never leaves half a cache
-            tmp = path.with_name(path.name + ".tmp")
-            try:
-                cached.to_csv(tmp)
-                os.replace(tmp, path)
-            finally:
-                tmp.unlink(missing_ok=True)
+        if dirty:  # M6: atomic cache write
+            _write_atomic(path, cached.to_csv)
         mask = (cached.index >= pd.Timestamp(start)) & (cached.index <= pd.Timestamp(end))
         out[t] = cached[mask]
     return out

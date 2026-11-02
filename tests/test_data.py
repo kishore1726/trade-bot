@@ -261,6 +261,88 @@ def test_tiny_overlap_difference_is_not_an_adjustment(tmp_path):
 
 
 
+def _split_source(old_days, all_days, rebuild_empty=lambda n: False):
+    """First call: pre-split history at 2000. Later calls: post-split prices at 1000; a call
+    for which rebuild_empty(call_no) is true returns nothing (Yahoo hiccup)."""
+    calls = []
+
+    def src(t, s, e):
+        calls.append((s, e))
+        if len(calls) == 1:
+            return frame(old_days, open=2000.0, high=2000.0, low=2000.0, close=2000.0)
+        if rebuild_empty(len(calls)):
+            return frame([])
+        df = frame(all_days, open=1000.0, high=1000.0, low=1000.0, close=1000.0)
+        return df[(df.index >= pd.Timestamp(s)) & (df.index <= pd.Timestamp(e))]
+    src.calls = calls
+    return src
+
+
+OLD = list(pd.bdate_range("2026-10-01", "2026-10-30"))
+ALL = list(pd.bdate_range("2026-10-01", "2026-11-06"))
+
+
+def test_split_is_recorded_in_ledger_without_out_param(tmp_path):
+    """C2 residual: `tradebot backtest` calls fetch_bars without `adjustments`; the split must
+    still reach the daily run."""
+    cfg = cfg_in(tmp_path)
+    src = _split_source(OLD, ALL)
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 10, 30), cfg, source=src)
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 11, 6), cfg, source=src)
+    (entry,) = data_mod.pending_adjustments(cfg)
+    assert entry["ticker"] == "X.NS" and entry["ratio"] == pytest.approx(0.5)
+
+
+def test_empty_rebuild_keeps_old_cache_and_reports_nothing(tmp_path):
+    """C2 residual: the rebuild download came back empty. Reporting the ratio while the old
+    cache stays makes the next run report it again (split applied twice)."""
+    cfg = cfg_in(tmp_path)
+    src = _split_source(OLD, ALL, rebuild_empty=lambda n: n == 3)  # call 3 = the rebuild
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 10, 30), cfg, source=src)
+    adj = {}
+    out = fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 11, 6), cfg, source=src, adjustments=adj)
+    assert adj == {} and data_mod.pending_adjustments(cfg) == []
+    assert (out["X.NS"]["close"] == 2000.0).all()  # never glued to post-split bars
+    cached = pd.read_csv(cfg.data_dir / "X.NS.csv", index_col=0, parse_dates=True)
+    assert (cached["close"] == 2000.0).all()
+    # The next run works: the split is recorded exactly once.
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 11, 6), cfg, source=src)
+    assert len(data_mod.pending_adjustments(cfg)) == 1
+
+
+def test_split_survives_a_later_ticker_failing(tmp_path):
+    """C2 residual: X's cache is rebuilt, then Y's download raises; X's ratio must not be lost."""
+    cfg = cfg_in(tmp_path)
+    src = _split_source(OLD, ALL)
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 10, 30), cfg, source=src)
+
+    def src2(t, s, e):
+        if t == "Y.NS":
+            raise ConnectionError("yahoo down")
+        return src(t, s, e)
+    with pytest.raises(ConnectionError):
+        fetch_bars(["X.NS", "Y.NS"], date(2026, 10, 1), date(2026, 11, 6), cfg, source=src2)
+    assert [e["ticker"] for e in data_mod.pending_adjustments(cfg)] == ["X.NS"]
+
+
+def test_crash_before_cache_swap_does_not_record_split_twice(tmp_path, monkeypatch):
+    cfg = cfg_in(tmp_path)
+    src = _split_source(OLD, ALL)
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 10, 30), cfg, source=src)
+    real = data_mod.os.replace
+
+    def boom(a, b):
+        if str(b).endswith(".csv"):
+            raise OSError("disk full")
+        return real(a, b)
+    monkeypatch.setattr(data_mod.os, "replace", boom)
+    with pytest.raises(OSError):
+        fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 11, 6), cfg, source=src)
+    monkeypatch.setattr(data_mod.os, "replace", real)
+    fetch_bars(["X.NS"], date(2026, 10, 1), date(2026, 11, 6), cfg, source=src)
+    assert len(data_mod.pending_adjustments(cfg)) == 1
+
+
 # --- M6: cache writes are atomic -----------------------------------------------------------
 
 def test_failed_cache_write_keeps_old_cache(tmp_path, monkeypatch):

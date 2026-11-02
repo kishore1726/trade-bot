@@ -8,6 +8,7 @@ import pytest
 from tradebot import daily
 from tradebot.backtest import run_backtest
 from tradebot.config import Config, CostConfig, TaxConfig
+from tradebot.data import pending_adjustments, record_adjustment
 from tradebot.portfolio import Portfolio
 from tradebot.store import IST, Store
 from tradebot.strategies import REGISTRY, Signal
@@ -63,8 +64,8 @@ class FakeFetch:
     def __call__(self, tickers, start, end, cfg, now=None, adjustments=None):
         self.calls.append((list(tickers), start, end))
         self.now = now
-        if adjustments is not None:
-            adjustments.update(self.adjust)
+        for t, r in self.adjust.items():  # as fetch_bars records them (C2 / R23 ledger)
+            record_adjustment(cfg, t, r, f"{t}|fake|{r}")
         if self.error:
             raise self.error
         lo, hi = pd.Timestamp(start), pd.Timestamp(end)
@@ -652,6 +653,58 @@ def test_adjustment_saved_even_when_day_cannot_be_processed(cfg, store, scripted
     fetch.adjust = {"A.NS": 0.5}
     assert run(TUE, cfg, store, fetch, Sender(), now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST)) == []
     assert store.get("portfolio")["positions"][0]["qty"] == 20
+
+
+def test_adjustment_applied_once_across_runs(cfg, store, scripted):
+    """C2 residual: the same recorded split must never rescale the position twice."""
+    start_paper(store, MON)
+    _hold_a(cfg, store)
+    bars = flat_bars(price=50.0)
+    fetch = FakeFetch(bars)
+    fetch.adjust = {"A.NS": 0.5}
+    run(TUE, cfg, store, fetch, Sender(), now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST))
+    run(WED, cfg, store, fetch, Sender(), now=lambda: datetime(2024, 1, 3, 21, 0, tzinfo=IST))
+    assert store.get("portfolio")["positions"][0]["qty"] == 20
+    assert len(store.events("price_adjustment")) == 1
+    assert pending_adjustments(cfg) == []  # consumed
+
+
+def test_adjustment_applied_when_download_fails(cfg, store, scripted):
+    """C2 residual: earlier tickers' caches were rebuilt before the download failed."""
+    start_paper(store, MON)
+    _hold_a(cfg, store)
+    fetch = FakeFetch(flat_bars(price=50.0), error=ConnectionError("down"))
+    fetch.adjust = {"A.NS": 0.5}
+    assert run(TUE, cfg, store, fetch, Sender(), now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST)) == []
+    assert store.get("portfolio")["positions"][0]["qty"] == 20
+
+
+def test_adjustment_recorded_by_backtest_reaches_paper(cfg, store, scripted):
+    """C2 residual: `tradebot backtest` rebuilt the cache earlier; the daily run's own download
+    sees no mismatch any more, but the ledger still carries the ratio."""
+    start_paper(store, MON)
+    _hold_a(cfg, store)
+    record_adjustment(cfg, "A.NS", 0.5, "A.NS|backtest|0.5")
+    run(TUE, cfg, store, FakeFetch(flat_bars(price=50.0)), Sender(),
+        now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST))
+    assert store.get("portfolio")["positions"][0]["qty"] == 20
+
+
+def test_ledger_entry_left_after_commit_is_not_reapplied(cfg, store, scripted, monkeypatch):
+    """Crash between the store commit and clearing the ledger file."""
+    start_paper(store, MON)
+    _hold_a(cfg, store)
+    record_adjustment(cfg, "A.NS", 0.5, "A.NS|x|0.5")
+    real = daily.forget_adjustments
+    monkeypatch.setattr(daily, "forget_adjustments", lambda cfg, ids: None)
+    run(TUE, cfg, store, FakeFetch(flat_bars(price=50.0)), Sender(),
+        now=lambda: datetime(2024, 1, 2, 21, 0, tzinfo=IST))
+    assert len(pending_adjustments(cfg)) == 1  # the "crash" left it behind
+    monkeypatch.setattr(daily, "forget_adjustments", real)
+    run(WED, cfg, store, FakeFetch(flat_bars(price=50.0)), Sender(),
+        now=lambda: datetime(2024, 1, 3, 21, 0, tzinfo=IST))
+    assert store.get("portfolio")["positions"][0]["qty"] == 20
+    assert pending_adjustments(cfg) == []
 
 
 # --- I1 / Ruling R24: owner commands during a run are never undone ------------------------
