@@ -191,3 +191,11 @@ def test_backtest_stores_segment_dates(monkeypatch, tmp_path):
         store.close()
     assert seg == {"in_sample": {"start": "2020-01-01", "end": "2021-12-29"},
                    "out_of_sample": {"start": "2021-12-30", "end": "2023-12-29"}}
+
+
+def test_readme_describes_messages_and_simulated_resume():
+    """M2/M3: README wording matches what the code sends."""
+    text = (cli.REPO / "README.md").read_text()
+    assert "its total value compared with the Nifty index" not in text
+    assert "since paper trading started (not just that week)" in text
+    assert "after 20 trading days" in text and "/resume" in text

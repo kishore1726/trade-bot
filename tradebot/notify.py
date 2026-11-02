@@ -10,6 +10,9 @@ from tradebot.store import Store
 
 MAX_LEN = 4000
 TIMEOUT = 10.0
+# M5: Telegram answers these when a message itself can never be delivered (bad text, chat
+# blocked). Anything else (429 rate limit, 5xx, network) is temporary and retried later.
+PERMANENT = {400, 403}
 
 
 def load_env(path: Path = Path(".env")) -> None:
@@ -39,7 +42,7 @@ def _chunks(text: str) -> list[str]:
         parts.append(text[:cut])
         text = text[cut:].lstrip("\n")
     parts.append(text)
-    return parts
+    return [p for p in parts if p.strip()]  # Telegram rejects empty messages
 
 
 def send(text: str, store: Store, http: httpx.Client | None = None) -> bool:
@@ -67,9 +70,15 @@ def _send(text: str, store: Store, http: httpx.Client | None) -> bool:
         return False
     client = http or httpx.Client(timeout=TIMEOUT)
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    all_sent = True
     try:
         for msg_id, msg in store.outbox_pending():
             resp = client.post(url, data={"chat_id": chat_id, "text": msg}, timeout=TIMEOUT)
+            if resp.status_code in PERMANENT:
+                store.outbox_mark_failed(msg_id)
+                store.log_event("telegram_rejected", {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"})
+                all_sent = False
+                continue
             if resp.status_code != 200:
                 store.log_event("telegram_error", {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"})
                 return False
@@ -81,4 +90,4 @@ def _send(text: str, store: Store, http: httpx.Client | None) -> bool:
     finally:
         if http is None:
             client.close()
-    return True
+    return all_sent

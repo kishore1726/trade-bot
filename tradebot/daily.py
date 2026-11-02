@@ -4,6 +4,11 @@ Runs unattended. Rules:
 - Paper trading starts only after /choose (store key "chosen_strategy").
 - Each day goes through backtest.step_day (Ruling R3), so paper == backtest by construction.
 - Bad data or a failed download -> alert, stop, don't advance "last_processed_day".
+  Exceptions: an unlisted market holiday is skipped (Ruling R22); a missing/stale ticker that is
+  neither held nor the benchmark is left out for the day (R26); today's missing bars before
+  20:00 IST just mean Yahoo is late (M8).
+- Stored state is read after the download; a day's save is discarded if an owner command
+  bumped "state_rev" meanwhile (R24). Only one run at a time (lock file, M7).
 - All days are computed in memory first; only then is each day committed in its own
   store transaction, so an unexpected error while computing leaves the stored state untouched.
   An error after days were saved (later commit, reports) says which days were processed and
@@ -13,6 +18,7 @@ Runs unattended. Rules:
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import traceback
 from dataclasses import asdict, dataclass
@@ -28,7 +34,7 @@ from tradebot.calendar import (HolidayFileError, is_trading_day, previous_tradin
                                trading_days_between)
 from tradebot.config import Config
 from tradebot.costs import trade_cost
-from tradebot.data import BAD, Bars, day_problems, fetch_bars
+from tradebot.data import BAD, MISSING, Bars, day_problems, fetch_bars
 from tradebot.metrics import Metrics, compute_metrics
 from tradebot.notify import send
 from tradebot.portfolio import Portfolio
@@ -38,6 +44,9 @@ from tradebot.strategies import REGISTRY, Signal
 
 # Today's bar is used only after this IST time (fetch_bars itself refuses bars before 16:00).
 RUN_AFTER = time(16, 15)
+# M8: until this IST time a missing bar for today is taken as "Yahoo hasn't published it yet":
+# nothing is traded for today and the hourly run retries. After it, Ruling R26 applies.
+LATE_PUBLISH_UNTIL = time(20, 0)
 WARMUP_DAYS = 450  # calendar days of history before the first processed day (SMA200 etc.)
 MAX_PROBLEM_LINES = 10
 # Ruling R23: a price-adjustment ratio this far from 1 is a split/bonus (shares change);
@@ -156,6 +165,38 @@ def run_daily(today: date, cfg: Config, store: Store, fetch=fetch_bars, sender=s
               now: Callable[[], datetime] | None = None) -> list[date]:
     """Process every trading day after "last_processed_day" up to `today` (today only after
     16:15 IST). Returns the days processed. Never raises."""
+    lock = _lock(cfg)
+    if lock is False:
+        return []  # M7: another run-daily is still busy; it does the work
+    try:
+        return _run_daily(today, cfg, store, fetch, sender, now)
+    finally:
+        if lock:
+            lock.close()
+
+
+def _lock(cfg: Config):
+    """An exclusive lock file next to the store: the open file, False if another run holds it,
+    or None if locking itself failed (then the run goes ahead unlocked)."""
+    try:
+        cfg.state_path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(cfg.state_path.parent / "daily.lock", "w")
+    except OSError:
+        _log_exception(cfg, "could not open the run lock")
+        return None
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return False
+    except OSError:
+        _log_exception(cfg, "could not take the run lock")
+        f.close()
+        return None
+    return f
+
+
+def _run_daily(today, cfg, store, fetch, sender, now) -> list[date]:
     committed: list[date] = []  # days already saved, even if a later step fails
     sender = _dedup(sender, store, now)
     try:
@@ -271,9 +312,12 @@ def _save_day(store: Store, day: _Day, history: dict[str, float]) -> None:
 
 
 def _unlisted_holiday(d: date, tickers: list[str], bars: Bars, cfg: Config) -> bool:
-    """Ruling R22: no ticker has a bar on d, but the benchmark has a bar on a later day."""
+    """Ruling R22: no ticker has a bar on d, but the benchmark has a bar on a later day.
+    A stale bar (M9: Yahoo repeating the previous day) does not count as a bar here."""
     ts = pd.Timestamp(d)
-    if any(x in bars and ts in bars[x].index for x in tickers):
+    present = {x: bars[x] for x in tickers if x in bars and ts in bars[x].index}
+    probs = day_problems(present, d)
+    if any(probs.get(x, ("", ""))[0] != MISSING for x in present):
         return False
     bench = bars.get(cfg.benchmark)
     return bench is not None and bool((bench.index > ts).any())
@@ -347,9 +391,17 @@ def _estimates(signals: list[Signal], portfolio: Portfolio, equity: float, bars:
     return out
 
 
-def _check_day(d: date, tickers: list[str], bars: Bars, held: set[str],
-               cfg: Config) -> tuple[str | None, dict[str, date | None]]:
-    """(halt alert text or None, tickers to leave out for d with their last bar date)."""
+def _late_text(d: date, tickers: list[str]) -> str:
+    shown = ", ".join(tickers[:MAX_PROBLEM_LINES]) + (" and others" if len(tickers) > MAX_PROBLEM_LINES else "")
+    return reports.alert(f"Today's prices ({d.isoformat()}) are not complete yet: nothing for {shown}. "
+                         "Yahoo may not have published them yet. Nothing has been traded for today; "
+                         "I'll retry within the hour.")
+
+
+def _check_day(d: date, tickers: list[str], bars: Bars, held: set[str], cfg: Config,
+               late: bool = False) -> tuple[str | None, dict[str, date | None]]:
+    """(halt alert text or None, tickers to leave out for d with their last bar date).
+    `late`: d is today and Yahoo may still publish missing bars (M8)."""
     ts = pd.Timestamp(d)
     empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"],
                          index=pd.DatetimeIndex([]), dtype=float)
@@ -360,6 +412,8 @@ def _check_day(d: date, tickers: list[str], bars: Bars, held: set[str],
     missing = list(probs)
     if not missing:
         return None, {}
+    if late:
+        return _late_text(d, missing), {}
     critical = [x for x in missing if x in held or x == cfg.benchmark]
     if critical:
         return _critical_text(d, critical, cfg), {}
@@ -438,7 +492,8 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
         if _unlisted_holiday(d, tickers, bars, cfg):
             done.append(_Day(None, holiday=d))
             continue
-        bad, left_out = _check_day(d, tickers, bars, set(state.portfolio.positions), cfg)
+        late = d == t.date() and t.time() < LATE_PUBLISH_UNTIL
+        bad, left_out = _check_day(d, tickers, bars, set(state.portfolio.positions), cfg, late)
         if bad:
             break
         day_bars = {k: v for k, v in bars.items() if k not in left_out}

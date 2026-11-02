@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import date
+from datetime import date, datetime
 
 import httpx
 
@@ -18,7 +18,7 @@ from tradebot.metrics import Metrics
 from tradebot.notify import load_env
 from tradebot.portfolio import Portfolio
 from tradebot.reports import money, backtest_comparison
-from tradebot.store import Store
+from tradebot.store import IST, Store
 
 POLL_TIMEOUT = 30
 ERROR_SLEEP = 10
@@ -147,13 +147,18 @@ def _choose(arg: str, cfg: Config, store: Store, today: date) -> str:
     return f"Chosen: {arg}. Paper trading starts with the next trading day."
 
 
+def _today(now=datetime.now) -> date:
+    """Today's date in India (M4): the Mac's own clock may be in another time zone."""
+    return now(IST).date()
+
+
 def handle_command(text: str, chat_id: int, cfg: Config, store: Store,
                    today: date | None = None) -> str:
     parts = (text or "").strip().split()
     if not parts or not parts[0].startswith("/"):
         return HELP
     cmd, arg = parts[0].split("@")[0].lower(), " ".join(parts[1:])
-    today = today or date.today()
+    today = today or _today()
     if cmd == "/status":
         return _status(cfg, store)
     if cmd == "/report":

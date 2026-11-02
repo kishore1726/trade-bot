@@ -45,7 +45,8 @@ def frame(index, opens, closes=None, lows=None):
     lows = list(lows if lows is not None else [min(o, c) for o, c in zip(opens, closes)])
     highs = [max(o, c) for o, c in zip(opens, closes)]
     return pd.DataFrame({"open": list(opens), "high": highs, "low": lows, "close": closes,
-                         "volume": [1000.0] * len(index)}, index=pd.DatetimeIndex(index), dtype=float)
+                         "volume": [1000.0 + i for i in range(len(index))]},  # never stale (M9)
+                        index=pd.DatetimeIndex(index), dtype=float)
 
 
 def flat_bars(start=date(2023, 12, 1), end=date(2024, 2, 29), price=100.0):
@@ -814,3 +815,46 @@ def test_summary_marks_buy_without_free_slot(cfg, store, scripted):
     run(TUE, cfg, store, FakeFetch(flat_bars()), s, now=lambda: datetime(2024, 1, 2, 21, tzinfo=IST))
     line = [x for x in s.messages[-1].splitlines() if "BUY A.NS" in x][0]
     assert "will be skipped: no free slot" in line
+
+
+
+# --- M7: overlapping runs ------------------------------------------------------------------
+
+def test_second_concurrent_run_exits_quietly(cfg, store, scripted):
+    import fcntl
+    start_paper(store, MON)
+    lock = cfg.state_path.parent / "daily.lock"
+    with open(lock, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another run-daily is busy
+        fetch, s = FakeFetch(flat_bars()), Sender()
+        assert run(TUE, cfg, store, fetch, s) == []
+        assert fetch.calls == [] and s.messages == []
+    assert run(TUE, cfg, store, FakeFetch(flat_bars()), Sender()) == [TUE]  # lock released
+
+
+# --- M8: today's bar not published yet -----------------------------------------------------
+
+@pytest.mark.parametrize("ticker", ["B.NS", BENCH])
+def test_todays_missing_bar_says_yahoo_may_be_late(cfg, store, scripted, ticker):
+    start_paper(store, MON)
+    bars = flat_bars()
+    bars[ticker] = bars[ticker].drop(pd.Timestamp(WED))
+    s = Sender()
+    assert run(WED, cfg, store, FakeFetch(bars), s, now=lambda: datetime(2024, 1, 3, 16, 30, tzinfo=IST)) == [TUE]
+    alert = [m for m in s.messages if m.startswith("⚠️")][0]
+    assert "Yahoo may not have published" in alert and "within the hour" in alert and ticker in alert
+    assert "config.yaml" not in alert
+    assert store.get("last_processed_day") == TUE.isoformat()
+
+
+# --- M9: stale bars are treated like missing ones ----------------------------------------
+
+def test_stale_unheld_ticker_is_left_out(cfg, store, scripted):
+    start_paper(store, MON)
+    bars = flat_bars()
+    b = bars["B.NS"].copy()
+    b.loc[pd.Timestamp(WED)] = b.loc[pd.Timestamp(TUE)]  # Yahoo repeated Tuesday's bar
+    bars["B.NS"] = b
+    s = Sender()
+    assert run(THU, cfg, store, FakeFetch(bars), s) == [TUE, WED, THU]
+    assert any("B.NS has had no data since" in m for m in s.messages)

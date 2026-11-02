@@ -7,6 +7,7 @@ Both start and end are INCLUSIVE. The frame has columns open/high/low/close/volu
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime, time, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -154,8 +155,13 @@ def fetch_bars(
                 merged = _normalise(pd.concat(parts))
                 dirty = dirty or not merged.equals(cached)
                 cached = merged
-        if dirty:
-            cached.to_csv(path)
+        if dirty:  # M6: write a temp file, then swap it in, so a crash never leaves half a cache
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                cached.to_csv(tmp)
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
         mask = (cached.index >= pd.Timestamp(start)) & (cached.index <= pd.Timestamp(end))
         out[t] = cached[mask]
     return out
@@ -164,10 +170,18 @@ def fetch_bars(
 MISSING, BAD = "missing", "bad"
 
 
+def is_etf(ticker: str) -> bool:
+    """ETFs (e.g. NIFTYBEES.NS) can legitimately show zero volume on Yahoo."""
+    t = ticker.upper()
+    return "BEES" in t or "ETF" in t
+
+
 def day_problems(bars: Bars, d: date) -> dict[str, tuple[str, str]]:
     """{ticker: (kind, message)} for trading day d; tickers without a problem are left out.
 
-    kind MISSING: there is no usable bar for d (the ticker can be left out for the day);
+    kind MISSING: there is no usable bar for d (the ticker can be left out for the day). A stale
+    bar counts as missing (M9): OHLC and volume identical to the previous bar (Yahoo repeating
+    an old bar), or zero volume for a stock that is not an ETF;
     kind BAD: a bar that cannot be trusted (never trade on it)."""
     out: dict[str, tuple[str, str]] = {}
     ts = pd.Timestamp(d)
@@ -184,6 +198,12 @@ def day_problems(bars: Bars, d: date) -> dict[str, tuple[str, str]]:
                 out[t] = (BAD, f"NaN price on {d}")
             elif row["low"] > min(row["open"], row["close"]) or row["high"] < max(row["open"], row["close"]):
                 out[t] = (BAD, f"inconsistent open/high/low/close on {d}")
+            elif row["volume"] == 0 and not is_etf(t):
+                out[t] = (MISSING, f"stale bar on {d} (zero volume)")
+            else:
+                before = df[df.index < ts]
+                if len(before) and before.iloc[-1][COLS].equals(row[COLS]):
+                    out[t] = (MISSING, f"stale bar on {d} (same prices and volume as the day before)")
     return out
 
 

@@ -75,8 +75,8 @@ Now that the bot is listening, reply to it in Telegram with `/choose trend` or `
 
 ## What the Telegram messages mean
 
-- **Daily summary** (each trading day): what the bot bought or sold in paper trading, what it holds, and its total value compared with the Nifty index.
-- **Weekly report** (after Friday): how the strategy did over the week and in total, and how that compares with the backtest.
+- **Daily summary** (each trading day): what the bot bought or sold in paper trading, what it holds, its total value and how much that changed since the previous trading day, and the orders for the next morning (with the rough number of shares and rupee amount, or why an order will be skipped).
+- **Weekly report** (after the last trading day of each week): how the strategy has done since paper trading started (not just that week), compared with simply holding the Nifty index and with the backtest.
 - **Alerts** (start with a warning sign): something needs your attention, for example missing price data or the safety switch.
 - **BELOW BENCHMARK**: the strategy did worse than simply holding the Nifty index over that period. If you see this often, the strategy may not be worth following.
 - **Kill switch**: if play-money value falls 15% from its highest point, the bot stops opening new positions and tells you. You decide what happens next (see `/resume`).
@@ -106,6 +106,7 @@ This stops the automatic runs and the Telegram listener and removes them. Your s
 - **Costs must be checked.** The brokerage, tax-on-sale and other charges in `config.yaml` are estimates. Compare each value with Groww's pricing page before trusting any result.
 - **Tax is an estimate** and is grouped by calendar year, not the Indian financial year (April to March). It is not tax advice.
 - **The first (in-sample) part of the backtest has no warm-up**, so the strategies have less history to work with at the very start.
+- **The backtest pretends you send `/resume`.** When the safety switch trips in the backtest, it assumes you send `/resume` after 20 trading days. In paper trading nothing resumes until you actually do, so paper results can differ from the backtest after a big fall.
 - **Check yearly:** the holiday list (`holidays/`) and the Nifty 50 list in `config.yaml` change; update them every year.
 - **Paper results are not a guarantee.** Real trading has delays, price gaps and emotions that play money does not.
 - **No real orders are ever placed** in this version.

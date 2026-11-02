@@ -17,7 +17,8 @@ COLS = ["open", "high", "low", "close", "volume"]
 def frame(dates, **over):
     idx = pd.DatetimeIndex(pd.to_datetime(dates))
     df = pd.DataFrame(
-        {"open": 100.0, "high": 110.0, "low": 95.0, "close": 105.0, "volume": 1000.0},
+        {"open": 100.0, "high": 110.0, "low": 95.0, "close": 105.0,
+         "volume": [1000.0 + i for i in range(len(idx))]},  # never stale (M9)
         index=idx,
     )
     for k, v in over.items():
@@ -257,3 +258,43 @@ def test_tiny_overlap_difference_is_not_an_adjustment(tmp_path):
     adj = {}
     out = fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 4), cfg, source=src, adjustments=adj)
     assert adj == {} and len(calls) == 2 and len(out["A.NS"]) == 3
+
+
+
+# --- M6: cache writes are atomic -----------------------------------------------------------
+
+def test_failed_cache_write_keeps_old_cache(tmp_path, monkeypatch):
+    cfg = cfg_in(tmp_path)
+    fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 3), cfg,
+               source=lambda *a: frame(["2026-11-02", "2026-11-03"]))
+    path = cfg.data_dir / "A.NS.csv"
+    good_text = path.read_text()
+
+    def broken(self, target, *a, **k):
+        with open(target, "w") as fh:
+            fh.write("date,open\n2026-11-02,1")  # half-written, then the disk fails
+        raise OSError("disk full")
+    monkeypatch.setattr(pd.DataFrame, "to_csv", broken)
+    with pytest.raises(OSError):
+        fetch_bars(["A.NS"], date(2026, 11, 2), date(2026, 11, 4), cfg,
+                   source=lambda *a: frame(["2026-11-03", "2026-11-04"]))
+    assert path.read_text() == good_text
+    assert [p.name for p in cfg.data_dir.iterdir()] == ["A.NS.csv"]
+
+
+# --- M9: stale bars ------------------------------------------------------------------------
+
+def test_validate_repeated_bar_is_stale():
+    bars = good()
+    bars["B.NS"].loc["2026-11-03", "volume"] = bars["B.NS"].loc["2026-11-02", "volume"]
+    p = validate_day(bars, D)
+    assert len(p) == 1 and "B.NS" in p[0] and "stale" in p[0]
+
+
+def test_validate_zero_volume_stock_is_stale_but_etf_is_fine():
+    bars = {"INFY.NS": frame(["2026-11-02", "2026-11-03"]),
+            "NIFTYBEES.NS": frame(["2026-11-02", "2026-11-03"])}
+    for t in bars:
+        bars[t].loc["2026-11-03", "volume"] = 0.0
+    p = validate_day(bars, D)
+    assert len(p) == 1 and "INFY.NS" in p[0] and "volume" in p[0]

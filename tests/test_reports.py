@@ -112,3 +112,22 @@ def test_daily_summary_buy_estimates_and_change():
     assert "Change since the previous day: +₹1,000 (+5.3%)" in txt
     first = reports.daily_summary(date(2026, 11, 2), _pf(), 20000.0, [], [], [], "trend", False)
     assert "Change since" not in first
+
+
+
+def test_zero_closed_trades_show_na():
+    """M1: no closed trades -> "n/a", not 0.0% / Rs 0."""
+    z = _m(trades=0, win_rate=0.0, avg_win=0.0, avg_loss=0.0, expectancy=0.0, expectancy_pct=0.0)
+    w = reports.weekly_report(z, "trend", _m(trades=0))
+    assert "Average win: n/a, average loss: n/a" in w
+    assert "Average profit per trade: n/a" in w
+    assert "win rate paper n/a / backtest n/a" in w and "profit per trade paper n/a / backtest n/a" in w
+    c = reports.backtest_comparison({"trend": {"in_sample": z, "out_of_sample": z}}, ["trend"])
+    assert "win rate n/a" in c and "Average win n/a, average loss n/a" in c
+    assert "Average profit per trade: n/a" in c
+
+
+def test_comparison_discloses_simulated_resume():
+    """M3: Ruling R11 is disclosed."""
+    c = reports.backtest_comparison({"trend": {"in_sample": _m(), "out_of_sample": _m()}}, ["trend"])
+    assert "20 trading days" in c and "/resume" in c

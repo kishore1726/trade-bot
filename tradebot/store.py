@@ -84,3 +84,7 @@ class Store:
 
     def outbox_mark_sent(self, id: int) -> None:
         self._conn.execute("UPDATE outbox SET sent=1 WHERE id=?", (id,))
+
+    def outbox_mark_failed(self, id: int) -> None:
+        """Telegram refused this message for good: keep it for the record, never retry it."""
+        self._conn.execute("UPDATE outbox SET sent=-1 WHERE id=?", (id,))

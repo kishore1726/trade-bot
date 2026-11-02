@@ -115,3 +115,39 @@ def test_send_never_raises_on_sqlite_error(store, monkeypatch):
 
     monkeypatch.setattr(store, "outbox_add", bad)
     assert notify.send("x", store, _client(lambda r: httpx.Response(200))) is False
+
+
+
+def test_permanently_rejected_message_does_not_block_outbox(store, monkeypatch):
+    """M5: HTTP 400/403 will never succeed; mark it failed and deliver the rest."""
+    _env(monkeypatch)
+    store.outbox_add("bad one")
+    sent = []
+
+    def handler(request):
+        body = request.content.decode()
+        if "bad+one" in body:
+            return httpx.Response(400, text="Bad Request: message text is empty")
+        sent.append(body)
+        return httpx.Response(200, json={"ok": True})
+
+    assert notify.send("good", store, _client(handler)) is False  # not everything was delivered
+    assert store.outbox_pending() == [] and len(sent) == 1 and "good" in sent[0]
+    assert store.events("telegram_rejected")
+    assert notify.send("next", store, _client(handler)) is True
+
+
+def test_429_and_5xx_still_retry_later(store, monkeypatch):
+    _env(monkeypatch)
+    for code in (429, 503):
+        notify.send("x", store, _client(lambda r, c=code: httpx.Response(c)))
+    assert len(store.outbox_pending()) == 2
+
+
+def test_no_empty_chunks(store, monkeypatch):
+    _env(monkeypatch)
+    notify.send("", store, _client(lambda r: httpx.Response(200)))
+    notify.send("\n\n", store, _client(lambda r: httpx.Response(200)))
+    text = "x" * notify.MAX_LEN + "\n" * 5
+    notify.send(text, store, _client(lambda r: httpx.Response(500)))
+    assert [len(t) for _, t in store.outbox_pending()] == [notify.MAX_LEN]

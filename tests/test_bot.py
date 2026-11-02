@@ -341,3 +341,11 @@ def test_report_shows_out_of_sample_period(cfg, store):
                      "out_of_sample": {"start": "2024-11-04", "end": "2026-11-02"}}
     store.set("backtest_summary", s)
     assert "2024-11-04 to 2026-11-02" in cmd("/report", cfg, store)
+
+
+
+def test_today_is_ist_date():
+    """M4: just after midnight in India it is still the previous day in UTC."""
+    from datetime import datetime, timezone
+    late_utc = datetime(2024, 1, 3, 19, 0, tzinfo=timezone.utc)  # 00:30 on 4 Jan in IST
+    assert bot._today(lambda tz: late_utc.astimezone(tz)) == date(2024, 1, 4)
