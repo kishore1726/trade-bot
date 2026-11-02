@@ -15,7 +15,7 @@ _EXIT_WHY = {"stop": "stop-loss hit", "signal": "strategy sell signal"}
 CAVEAT = "Win rate alone can mislead: a few big wins can beat many small losses."
 
 
-def _rs(x: float) -> str:
+def money(x: float) -> str:
     return f"{'-' if round(x) < 0 else ''}₹{abs(x):,.0f}"
 
 
@@ -36,21 +36,21 @@ def daily_summary(d: date, portfolio: Portfolio, equity: float, signals: list[Si
     if caught_up_days:
         n = len(caught_up_days)
         lines.append(f"Caught up {n} missed day(s): " + ", ".join(x.isoformat() for x in caught_up_days))
-    lines += ["", f"Cash: {_rs(portfolio.cash)}", f"Total value: {_rs(equity)}",
+    lines += ["", f"Cash: {money(portfolio.cash)}", f"Total value: {money(equity)}",
               f"Open positions: {len(portfolio.positions)}"]
     for p in portfolio.positions.values():
-        lines.append(f"  {p.ticker}: {p.qty} shares, bought at {_rs(p.entry_price)}, stop {_rs(p.stop)}")
+        lines.append(f"  {p.ticker}: {p.qty} shares, bought at {money(p.entry_price)}, stop {money(p.stop)}")
     if exits:
         lines += ["", "Closed today:"]
         for t in exits:
             why = _EXIT_WHY.get(t.reason, t.reason)
-            lines.append(f"  {t.ticker}: {t.qty} shares sold at {_rs(t.exit_price)} ({why}), "
-                         f"profit/loss {_rs(t.pnl)} after costs")
+            lines.append(f"  {t.ticker}: {t.qty} shares sold at {money(t.exit_price)} ({why}), "
+                         f"profit/loss {money(t.pnl)} after costs")
     lines += ["", "Orders for tomorrow's open:"]
     if signals:
         for s in signals:
             if s.action == "BUY":
-                stop = f", stop {_rs(s.stop)}" if s.stop is not None else ""
+                stop = f", stop {money(s.stop)}" if s.stop is not None else ""
                 lines.append(f"  BUY {s.ticker}{stop} - {s.reason}")
             else:
                 lines.append(f"  SELL {s.ticker} - {s.reason}")
@@ -75,18 +75,18 @@ def weekly_report(metrics: Metrics, strategy_name: str, backtest_oos: Metrics | 
         f"Closed trades: {m.trades}",
         f"Win rate: {_pct(m.win_rate)}" if m.trades else "No closed trades yet",
         CAVEAT,
-        f"Average win: {_rs(m.avg_win)}, average loss: {_rs(m.avg_loss)}",
-        f"Average profit per trade: {_rs(m.expectancy)}",
+        f"Average win: {money(m.avg_win)}, average loss: {money(m.avg_loss)}",
+        f"Average profit per trade: {money(m.expectancy)}",
         f"Worst fall from a peak: {_pct(m.max_drawdown)}",
         f"Return: {_pct(m.total_return)} vs Nifty buy-and-hold {_pct(m.benchmark_return)}",
         f"After tax: {_pct(m.post_tax_return)} vs Nifty {_pct(m.benchmark_post_tax_return)}",
-        f"Total trading costs: {_rs(m.total_costs)}",
+        f"Total trading costs: {money(m.total_costs)}",
     ]
     if backtest_oos is not None:
         b = backtest_oos
         lines.append(
             f"Paper vs backtest: win rate paper {_pct(m.win_rate)} / backtest {_pct(b.win_rate)}, "
-            f"profit per trade paper {_rs(m.expectancy)} / backtest {_rs(b.expectancy)}, "
+            f"profit per trade paper {money(m.expectancy)} / backtest {money(b.expectancy)}, "
             f"worst fall paper {_pct(m.max_drawdown)} / backtest {_pct(b.max_drawdown)}")
     return "\n".join(lines)
 
@@ -101,7 +101,7 @@ def backtest_comparison(results: dict[str, dict[str, Metrics]], ranking: list[st
         lines += [
             head,
             f"  Trades: {oos.trades}, win rate {_pct(oos.win_rate)}",
-            f"  Average win {_rs(oos.avg_win)}, average loss {_rs(oos.avg_loss)}",
+            f"  Average win {money(oos.avg_win)}, average loss {money(oos.avg_loss)}",
             f"  Worst fall from a peak: {_pct(oos.max_drawdown)}",
             f"  {_vs_bench(oos).capitalize()}",
             f"  After tax: {_pct(oos.post_tax_return)} vs Nifty {_pct(oos.benchmark_post_tax_return)}",

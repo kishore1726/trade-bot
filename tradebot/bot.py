@@ -17,7 +17,7 @@ from tradebot.config import Config
 from tradebot.metrics import Metrics
 from tradebot.notify import load_env
 from tradebot.portfolio import Portfolio
-from tradebot.reports import _rs, backtest_comparison
+from tradebot.reports import money, backtest_comparison
 from tradebot.store import Store
 
 POLL_TIMEOUT = 30
@@ -42,11 +42,11 @@ def _status(cfg: Config, store: Store) -> str:
     hist = store.get("equity_history") or {}
     last_eq = hist[max(hist)] if hist else None
     lines = [f"Strategy: {store.get('chosen_strategy') or 'none yet'}",
-             f"Cash: {_rs(p.cash)}",
-             f"Last equity: {_rs(last_eq) if last_eq is not None else 'not known yet'}"]
+             f"Cash: {money(p.cash)}",
+             f"Last equity: {money(last_eq) if last_eq is not None else 'not known yet'}"]
     if p.positions:
         lines.append("Positions:")
-        lines += [f"  {x.ticker}: {x.qty} @ {_rs(x.entry_price)}, stop {_rs(x.stop)}"
+        lines += [f"  {x.ticker}: {x.qty} @ {money(x.entry_price)}, stop {money(x.stop)}"
                   for x in p.positions.values()]
     else:
         lines.append("Positions: none")
