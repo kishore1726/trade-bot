@@ -469,7 +469,7 @@ def _run(today, cfg, store, fetch, sender, now, committed: list[date]) -> list[d
     with store.transaction():  # one consistent snapshot of everything the run uses
         rev = store.get("state_rev", 0)
         same = (store.get("chosen_strategy") == name
-                and store.get("last_processed_day") == (last_raw and last.isoformat()))
+                and store.get("last_processed_day") == last_raw)
         raw = store.get("portfolio")
         portfolio = Portfolio.from_dict(raw) if raw else Portfolio(cfg.capital)
         history: dict[str, float] = dict(store.get("equity_history") or {})

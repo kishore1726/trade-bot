@@ -858,3 +858,18 @@ def test_stale_unheld_ticker_is_left_out(cfg, store, scripted):
     s = Sender()
     assert run(THU, cfg, store, FakeFetch(bars), s) == [TUE, WED, THU]
     assert any("B.NS has had no data since" in m for m in s.messages)
+
+
+def test_choose_during_download_is_kept(cfg, store, scripted, monkeypatch):
+    monkeypatch.setitem(REGISTRY, "momentum", Momentum)
+    start_paper(store, date(2023, 12, 29))
+    store.set("backtest_summary", {"results": {"scripted": {}, "momentum": {}}})
+    other = Store(cfg.state_path)
+    try:
+        s = Sender()
+        assert run(WED, cfg, store, RacingFetch(flat_bars(), "/choose momentum", cfg, other), s) == []
+    finally:
+        other.close()
+    assert store.get("chosen_strategy") == "momentum"
+    assert store.get("last_processed_day") == MON.isoformat()
+    assert store.events("state_changed_during_run") and s.messages == []
